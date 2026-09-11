@@ -14,6 +14,7 @@
 #define HOLD_TTL_S  120
 #define INV_BATCH   64          /* names per dnzinv frame */
 #define AE_PERIOD_S 60          /* anti-entropy: re-inv the store this often */
+#define PULL_COOL_S 15          /* one zget per (peer, name) in this window */
 
 typedef struct {
     void          *peer;
@@ -34,6 +35,7 @@ static struct {
     Peer          peers[MAX_PEERS];
     Held          hold[HOLD_SLOTS];
     time_t        next_ae;
+    struct { Peer *p; char name[SP_NAME_MAX + 1]; time_t at; } pull[48];
 } g;
 
 void dnsnet_init(SpState *st, SpChainOracle oracle, int verbose) {
@@ -118,18 +120,15 @@ static void send_zdat(Peer *to, const char *name) {
     to->send(to->peer, "dnzdat", frame, (size_t)o);
 }
 
-void dnsnet_announce(const char *name) {
-    static InvAcc a;
-    a.off = 0; a.count = 0; a.to = NULL;    /* broadcast */
-    inv_add(&a, name);
-    inv_flush(&a);
-}
-
 static void send_inv_one(Peer *to, const char *name) {
     static InvAcc a;
     a.off = 0; a.count = 0; a.to = to;
     inv_add(&a, name);
     inv_flush(&a);
+}
+
+void dnsnet_announce(const char *name) {
+    send_inv_one(NULL, name);               /* broadcast */
 }
 
 /* ── hold queue (ops anchored ahead of our sync) ─────────────────────────────── */
@@ -165,6 +164,26 @@ static void hold_service(void) {
 }
 
 /* ── receive ─────────────────────────────────────────────────────────────────── */
+/* one zget per (peer, name) per PULL_COOL_S — a digest mismatch that cannot
+ * converge (budget-full of different records) used to emit a get every frame. */
+static int pull_ok(Peer *p, const char *name) {
+    time_t now = time(NULL);
+    int slot = -1;
+    for (int i = 0; i < 48; i++) {
+        if (g.pull[i].p == p && g.pull[i].name[0] && !strcmp(g.pull[i].name, name)) {
+            if (now - g.pull[i].at < PULL_COOL_S) return 0;
+            g.pull[i].at = now;
+            return 1;
+        }
+        if (slot < 0 && (!g.pull[i].p || now - g.pull[i].at >= PULL_COOL_S * 4)) slot = i;
+    }
+    if (slot < 0) slot = 0;
+    g.pull[slot].p = p;
+    snprintf(g.pull[slot].name, sizeof g.pull[slot].name, "%s", name);
+    g.pull[slot].at = now;
+    return 1;
+}
+
 static void on_zinv(Peer *from, const uint8_t *pay, int n) {
     int off = 0; uint64_t count;
     if (!sp_rvar(pay, n, &off, &count) || count > 4096) return;
@@ -179,6 +198,7 @@ static void on_zinv(Peer *from, const uint8_t *pay, int n) {
         uint8_t ours[32];
         dns_state_digest(g.st, name, ours);
         if (memcmp(ours, their, 32) != 0) {
+            if (!pull_ok(from, name)) continue;
             uint8_t req[1 + SP_NAME_MAX]; int ro = 0;
             req[ro++] = (uint8_t)nlen;
             memcpy(req + ro, name, (size_t)nlen); ro += nlen;
@@ -198,6 +218,7 @@ static void on_zget(Peer *from, const uint8_t *pay, int n) {
 }
 
 static void on_zdat(Peer *from, const uint8_t *pay, int n) {
+    (void)from;
     if (n < 1) return;
     int off = 0;
     int nlen = pay[off++];
@@ -227,13 +248,13 @@ static void on_zdat(Peer *from, const uint8_t *pay, int n) {
         /* announce to everyone — including the source: if we also hold ops it
          * lacked, its digest now mismatches ours and it pulls back. */
         dnsnet_announce(name);
-    } else {
-        /* nothing new for us — the source may be the stale side. Answer with
-         * OUR digest for the name (cheap, idempotent); the source zgets from
-         * us iff it actually differs, so an equal-state exchange goes silent
-         * instead of ping-ponging dumps. */
-        send_inv_one(from, name);
     }
+    /* no-change: SILENCE. Re-inv'ing the source when we could not admit its
+     * dump (budget full of different records, dups, etc.) made its digest
+     * still differ, which pulled another zget, which dumped again — an
+     * unbounded frame storm (dns/test/net_test.c sec_livelock). Anti-entropy
+     * still advertises our digest every AE_PERIOD_S, so a peer that actually
+     * needs our records pulls once a minute, not once a frame. */
 }
 
 /* ── the IdxMeshHooks mirror ─────────────────────────────────────────────────── */

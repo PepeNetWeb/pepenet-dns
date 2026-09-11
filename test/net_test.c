@@ -39,17 +39,9 @@
  *       fill it, because hold_push does NOT dedupe. Recorded below as a
  *       finding, with the exact replay count that saturates it.
  *
- *   N7. CONVERGENCE. Two nodes exchanging frames must eventually go silent.
- *       See the FAILS note on sec_livelock: they do not, when both budgets
- *       are full of records the other cannot admit.
- *
- * FAILS (real product defect, deliberately NOT weakened): sec_livelock. Two
- * honest nodes whose 8 KB budgets are both full of DIFFERENT records reject
- * each other's ops for budget, so `changed` stays 0 forever. on_zdat answers
- * a no-change dump with send_inv_one, whose digest still differs, which pulls
- * another dnzget, which answers another dnzdat — an unbounded frame storm
- * between two well-behaved peers. This suite therefore exits non-zero, and is
- * kept out of `make check-all` (see the check-gossip target).
+ *   N7. CONVERGENCE. Two nodes exchanging frames must eventually go silent —
+ *       including when both budgets are full of DIFFERENT records (a no-change
+ *       dump is silent; anti-entropy, not per-dump re-inv, advertises state).
  */
 #include "dns_state.h"
 #include "dns_net.h"
@@ -495,11 +487,9 @@ static void sec_hold(SpState *st) {
     g_tip = saved;
 }
 
-/* ── N7. convergence (the livelock) ─────────────────────────────────────────── */
-/* FAILS: two honest nodes whose budgets are both full of DIFFERENT records
- * never go silent. Each rejects the other's ops for budget, so `changed`
- * stays 0, and on_zdat's no-change branch answers with send_inv_one — whose
- * digest still differs, pulling another zget → zdat → inv, forever. */
+/* ── N7. convergence ────────────────────────────────────────────────────────── */
+/* Two honest nodes whose budgets are full of DIFFERENT records used to storm
+ * (no-change dump re-inv'd the source). No-change is now silent. */
 /* Run an exchange to silence or to `limit` rounds. Records the command cycle
  * in `trace` (space-separated) so a non-converging run explains itself. */
 static int run_exchange(SpState *A, SpState *B, int limit, int *frames_out,
@@ -583,7 +573,7 @@ static void sec_livelock(void) {
     printf("     (cycle: %s ...)\n", trace);
     CK(rounds < LIMIT,
        "the exchange goes silent instead of ping-ponging forever "
-       "(FAILS: budget-rejected dumps re-inv each other without end)");
+       "(no-change dumps stay silent; AE is the only re-inv)");
 
     sp_state_close(A);
     sp_state_close(B);
