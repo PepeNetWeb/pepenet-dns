@@ -15,11 +15,13 @@
 #define INV_BATCH   64          /* names per dnzinv frame */
 #define AE_PERIOD_S 60          /* anti-entropy: re-inv the store this often */
 #define PULL_COOL_S 15          /* one zget per (peer, name) in this window */
+#define GET_COOL_S   2          /* inbound zget: one dump per peer per this */
 
 typedef struct {
     void          *peer;
     dnsnet_send_fn send;
     int            used;
+    time_t         last_zget;       /* inbound zget token (GET_COOL_S) */
 } Peer;
 
 typedef struct {
@@ -217,6 +219,9 @@ static void on_zget(Peer *from, const uint8_t *pay, int n) {
     char name[SP_NAME_MAX + 1];
     memcpy(name, pay + 1, (size_t)nlen); name[nlen] = '\0';
     if (!sp_name_valid(name, (size_t)nlen)) return;
+    time_t now = time(NULL);
+    if (from->last_zget && now - from->last_zget < GET_COOL_S) return;
+    from->last_zget = now;
     send_zdat(from, name);
 }
 
@@ -267,6 +272,7 @@ void *dnsnet_up(void *peer, dnsnet_send_fn send) {
             g.peers[i].peer = peer;
             g.peers[i].send = send;
             g.peers[i].used = 1;
+            g.peers[i].last_zget = 0;
             send_inv_all(&g.peers[i]);      /* our whole shelf, on connect */
             return &g.peers[i];
         }
