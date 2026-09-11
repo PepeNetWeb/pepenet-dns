@@ -133,13 +133,16 @@ void dnsnet_announce(const char *name) {
 
 /* ── hold queue (ops anchored ahead of our sync) ─────────────────────────────── */
 static void hold_push(const uint8_t *op, int len) {
-    for (int i = 0; i < HOLD_SLOTS; i++)
-        if (!g.hold[i].len) {
-            memcpy(g.hold[i].blob, op, (size_t)len);
-            g.hold[i].len = len;
-            g.hold[i].expiry = time(NULL) + HOLD_TTL_S;
-            return;
-        }
+    int empty = -1;
+    for (int i = 0; i < HOLD_SLOTS; i++) {
+        if (!g.hold[i].len) { if (empty < 0) empty = i; continue; }
+        if (g.hold[i].len == len && !memcmp(g.hold[i].blob, op, (size_t)len))
+            return;                                 /* already held */
+    }
+    if (empty < 0) return;
+    memcpy(g.hold[empty].blob, op, (size_t)len);
+    g.hold[empty].len = len;
+    g.hold[empty].expiry = time(NULL) + HOLD_TTL_S;
 }
 
 static void hold_service(void) {
