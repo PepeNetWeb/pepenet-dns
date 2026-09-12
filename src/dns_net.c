@@ -16,12 +16,17 @@
 #define AE_PERIOD_S 60          /* anti-entropy: re-inv the store this often */
 #define PULL_COOL_S 15          /* one zget per (peer, name) in this window */
 #define GET_COOL_S   2          /* inbound zget: one dump per peer per this */
+#define ZDAT_OPS_MAX 64         /* one frame ≤ ECDSA burst */
+#define ECDSA_RATE   64         /* tokens per second per Peer */
+#define ECDSA_BURST  64
 
 typedef struct {
     void          *peer;
     dnsnet_send_fn send;
     int            used;
     time_t         last_zget;       /* inbound zget token (GET_COOL_S) */
+    int            ecdsa_tokens;
+    time_t         ecdsa_t;
 } Peer;
 
 typedef struct {
@@ -38,7 +43,35 @@ static struct {
     Held          hold[HOLD_SLOTS];
     time_t        next_ae;
     struct { Peer *p; char name[SP_NAME_MAX + 1]; time_t at; } pull[48];
+    void (*misbehave)(void *peer, int score, const char *why);
 } g;
+
+void dnsnet_set_misbehave(void (*fn)(void *peer, int score, const char *why)) {
+    g.misbehave = fn;
+}
+
+static void strike(Peer *p, int n, const char *why) {
+    if (p && p->used && g.misbehave) g.misbehave(p->peer, n, why);
+}
+
+static int ecdsa_cheap(int rc, const char *err) {
+    if (rc == -1) return 1;
+    if (rc == 0 && err) {
+        if (strstr(err, "malformed") || strstr(err, "invalid name") ||
+            strstr(err, "name unowned") || strstr(err, "signer is not the owner"))
+            return 1;
+    }
+    return 0;
+}
+
+static void ecdsa_refill(Peer *p, time_t now) {
+    if (!p->ecdsa_t) { p->ecdsa_tokens = ECDSA_BURST; p->ecdsa_t = now; return; }
+    int dt = (int)(now - p->ecdsa_t);
+    if (dt <= 0) return;
+    p->ecdsa_tokens += dt * ECDSA_RATE;
+    if (p->ecdsa_tokens > ECDSA_BURST) p->ecdsa_tokens = ECDSA_BURST;
+    p->ecdsa_t = now;
+}
 
 void dnsnet_init(SpState *st, SpChainOracle oracle, int verbose) {
     memset(&g, 0, sizeof g);
@@ -191,7 +224,8 @@ static int pull_ok(Peer *p, const char *name) {
 
 static void on_zinv(Peer *from, const uint8_t *pay, int n) {
     int off = 0; uint64_t count;
-    if (!sp_rvar(pay, n, &off, &count) || count > 4096) return;
+    if (!sp_rvar(pay, n, &off, &count)) return;
+    if (count > 4096) { strike(from, 20, "zinv count"); return; }
     for (uint64_t i = 0; i < count; i++) {
         if (off + 1 > n) return;
         int nlen = pay[off++];
@@ -226,7 +260,6 @@ static void on_zget(Peer *from, const uint8_t *pay, int n) {
 }
 
 static void on_zdat(Peer *from, const uint8_t *pay, int n) {
-    (void)from;
     if (n < 1) return;
     int off = 0;
     int nlen = pay[off++];
@@ -235,22 +268,45 @@ static void on_zdat(Peer *from, const uint8_t *pay, int n) {
     memcpy(name, pay + off, (size_t)nlen); name[nlen] = '\0'; off += nlen;
     if (!sp_name_valid(name, (size_t)nlen)) return;
     uint64_t count;
-    if (!sp_rvar(pay, n, &off, &count) || count > 1024) return;
+    if (!sp_rvar(pay, n, &off, &count)) return;
+    if (count > ZDAT_OPS_MAX) { strike(from, 20, "zdat count"); return; }
     int changed = 0;
     char err[128];
+    int owner_strikes = 0;
+    time_t now = time(NULL);
+    if (from) ecdsa_refill(from, now);
+    uint64_t leftover = 0;
     for (uint64_t i = 0; i < count; i++) {
         uint64_t ol;
         if (!sp_rvar(pay, n, &off, &ol) || ol < 1 || ol > SP_STATE_OP_MAX || off + (int)ol > n) return;
         const uint8_t *op = pay + off; off += (int)ol;
+        if (from && (!from->used || from->ecdsa_tokens <= 0)) { leftover = count - i; break; }
         /* the frame's name must match the op's (one name per dump) */
         SpStateOp p;
         if (!sp_state_op_parse(op, (int)ol, &p) ||
             p.name_len != nlen || memcmp(p.name, name, (size_t)nlen) != 0) continue;
         int rc = sp_state_admit(g.st, &g.o, DNS_BUDGET, DNS_SCOPE, op, (int)ol, err, sizeof err);
+        if (from && !ecdsa_cheap(rc, err)) {
+            from->ecdsa_tokens--;
+            if (from->ecdsa_tokens < 0) from->ecdsa_tokens = 0;
+        }
+        if (rc == 0 && err[0] && strstr(err, "signer is not the owner") && owner_strikes < 20) {
+            strike(from, 1, "non-owner op");
+            owner_strikes++;
+        }
         if (rc == 1) changed = 1;
         else if (rc == -2) hold_push(op, (int)ol);
         else if (rc == 0 && g.verbose)
             fprintf(stderr, "dnsnet: reject %s: %s\n", name, err);
+        if (from && from->ecdsa_tokens <= 0 && i + 1 < count) { leftover = count - i - 1; break; }
+    }
+    if (leftover) {
+        static time_t last_thr;
+        if (now - last_thr >= 10) {
+            last_thr = now;
+            fprintf(stderr, "dnsnet: ecdsa throttle leftover %llu ops\n",
+                    (unsigned long long)leftover);
+        }
     }
     if (changed) {
         /* announce to everyone — including the source: if we also hold ops it
@@ -273,6 +329,8 @@ void *dnsnet_up(void *peer, dnsnet_send_fn send) {
             g.peers[i].send = send;
             g.peers[i].used = 1;
             g.peers[i].last_zget = 0;
+            g.peers[i].ecdsa_tokens = ECDSA_BURST;
+            g.peers[i].ecdsa_t = time(NULL);
             send_inv_all(&g.peers[i]);      /* our whole shelf, on connect */
             return &g.peers[i];
         }

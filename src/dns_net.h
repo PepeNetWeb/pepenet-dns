@@ -35,6 +35,9 @@ void  dnsnet_tick(void);                               /* hold-queue + anti-entr
 /* A local publish changed `name` — announce it to every live peer. */
 void  dnsnet_announce(const char *name);
 
+/* Overlay → serve score hook. NULL-checked. `peer` is the SConn* from dnsnet_up. */
+void  dnsnet_set_misbehave(void (*fn)(void *peer, int score, const char *why));
+
 /* live peer count (status surfaces) */
 int   dnsnet_peers(void);
 

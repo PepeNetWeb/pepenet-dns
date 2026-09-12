@@ -229,7 +229,8 @@ static void *net_main(void *a) {
     g_orc = dns_chain_oracle(g_ch);
     dnsnet_init(g_st, g_orc, g_verbose);
 
-    IdxMeshHooks mesh = { mesh_up, mesh_msg, mesh_down, mesh_tick, NULL };
+    IdxMeshHooks mesh = { mesh_up, mesh_msg, mesh_down, mesh_tick, NULL, serve_conn_misbehave };
+    dnsnet_set_misbehave(serve_conn_misbehave);
     idx_serve(na->coin, na->db, na->listen, na->dial, &g_stop, &mesh);
 
     sp_state_close(g_st); dns_chain_close(g_ch);

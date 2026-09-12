@@ -41,7 +41,7 @@ ENGINE_SRC := $(addprefix $(SMDIR)/,fold.c decode.c oracle.c digest.c state.c \
               ripemd160.c gen.c harness.c ecmh.c)
 # indexer chain sources (minus its CLI main.c / test_chain.c) + secp shim
 IDX_SRC    := $(addprefix $(IDXSRC)/,attrib.c adapter.c oracle_feed.c db.c chain.c \
-              base58.c sync.c pow.c serve_store.c txcheck.c mempool.c) $(SHIM)
+              base58.c sync.c pow.c serve_store.c txcheck.c mempool.c net_policy.c) $(SHIM)
 # pepenet-mesh facade, from source (sp_* crypto/view/wire/state)
 MESH_SRC   := $(addprefix $(MESHDIR)/src/,crypto.c view.c wire.c state.c)
 # the DNS overlay + the dnsd driver
@@ -149,12 +149,9 @@ clean-tests:
 .PHONY: check-all check-fuzz clean-tests
 
 # ── the adversarial gossip suite (src/dns_net.c) ─────────────────────────────
-# Deliberately OUTSIDE check-all: its last section proves a real convergence
-# defect (two nodes whose 8 KB budgets are both full of different records
-# ping-pong inv→get→dat forever, because on_zdat answers a no-change dump with
-# another inv), so it exits non-zero. Folding it into check-all would make the
-# green suite red for a reason that is not a regression — the same split
-# pepenet-tls uses for check-deep.
+# Gossip suite. No-change dumps are silent (0.2.3); kept as its own target so
+# a long 200k-mutation soak does not gate the fast check-all. Fold into
+# check-all once CI time is comfortable.
 #
 #   make check-gossip     peer table, hostile frames, 200k-mutation fuzz,
 #                         inv/get/dat semantics, the hold queue, convergence
