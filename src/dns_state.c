@@ -54,11 +54,11 @@ int dns_payload_unpack(const uint8_t *p, int plen, uint32_t *ttl,
     return *rdlen >= 1 && *rdlen <= ZONE_MAX_RDATA;
 }
 
-/* ── on-chain carrier (0xFF 'P' 'N' 0xD8) ───────────────────────────────────── */
-int dns_rec_encode(const zone_rec *r, uint8_t *out, int outmax) {
+/* ── on-chain carrier (0xFF ‖ coin magic ‖ ZONE_OP) ─────────────────────────── */
+int dns_rec_encode(const zone_rec *r, const uint8_t magic[2], uint8_t *out, int outmax) {
     int o = 0, n; uint8_t tmp[8];
-    if (outmax < 4) return -1;
-    out[o++] = 0xFF; out[o++] = 'P'; out[o++] = 'N'; out[o++] = ZONE_OP;
+    if (!magic || outmax < 4) return -1;
+    out[o++] = 0xFF; out[o++] = magic[0]; out[o++] = magic[1]; out[o++] = ZONE_OP;
     int ll = (int)strlen(r->label);
     n = sp_wvar(tmp, (uint64_t)ll);   if (o + n + ll > outmax) return -1; memcpy(out + o, tmp, n); o += n;
     memcpy(out + o, r->label, (size_t)ll); o += ll;
@@ -69,8 +69,9 @@ int dns_rec_encode(const zone_rec *r, uint8_t *out, int outmax) {
     return o;
 }
 
-int dns_rec_decode(const uint8_t *c, int clen, zone_rec *r) {
-    if (clen < 4 || c[0] != 0xFF || c[1] != 'P' || c[2] != 'N' || c[3] != ZONE_OP) return 0;
+int dns_rec_decode(const uint8_t *c, int clen, const uint8_t magic[2], zone_rec *r) {
+    if (!magic || clen < 4 || c[0] != 0xFF || c[1] != magic[0] || c[2] != magic[1] ||
+        c[3] != ZONE_OP) return 0;
     int off = 4; uint64_t ll, type, ttl;
     if (!sp_rvar(c, clen, &off, &ll) || ll >= sizeof r->label || off + (int)ll > clen) return 0;
     memcpy(r->label, c + off, (size_t)ll); r->label[ll] = '\0'; off += (int)ll;
@@ -85,9 +86,9 @@ int dns_rec_decode(const uint8_t *c, int clen, zone_rec *r) {
     return 1;
 }
 
-int dns_rec_escape_hatchable(const zone_rec *r) {
+int dns_rec_escape_hatchable(const zone_rec *r, const uint8_t magic[2]) {
     uint8_t tmp[256];
-    int n = dns_rec_encode(r, tmp, sizeof tmp);
+    int n = dns_rec_encode(r, magic, tmp, sizeof tmp);
     return n > 0 && n <= DNS_ONCHAIN_MAX;
 }
 

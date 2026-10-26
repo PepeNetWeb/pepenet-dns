@@ -278,12 +278,14 @@ static int usage(const char *p) {
         "                     a public seed passes its chain port (pep 33874)\n"
         "  --peer host:port   a chain peer to dial for the mesh (repeatable)\n"
         "                     default pep: pepenet.shibpost.com:33874 +\n"
-        "                     net.pepecoin.services:33874; doge: shibpost:22556\n"
+        "                     net.pepecoin.services:33874; doge:\n"
+        "                     dogenet.shibpost.com:22556 +\n"
+        "                     seed.dogecoin.services:22556\n"
         "  --sync-peer <ip>   pin the chain-sync peer                [default auto]\n"
         "  --no-sync          do not self-sync (an external indexer feeds --db)\n"
         "  --dns-addr <ip>    UDP/TCP DNS listen addr                [127.0.0.1]\n"
         "  --dns-port <n>     UDP/TCP DNS listen port                [5353]\n"
-        "  --suffix <tld>     hostchain suffix (no dot)              [pepe]\n"
+        "  --suffix <tld>     hostchain suffix (no dot)              [from --coin]\n"
         "  --tls-redirect <ip> answer A=<ip> for DANE names (steer to local proxy)\n"
         "  --key <file|hex>   owner key — enables publishing --zone + live PUT/DEL\n"
         "  --name <apex>      flat pepenet name (§3.1: [a-z0-9-], 1..32)\n"
@@ -296,7 +298,7 @@ static int usage(const char *p) {
 int main(int argc, char **argv) {
     const char *db = NULL, *store = NULL, *keyarg = NULL, *name = NULL, *zonef = NULL;
     const char *dns_addr = "127.0.0.1", *ctl_path = NULL, *coin = "pep", *sync_peer = "auto";
-    int dns_port = 5353, do_sync = 1;
+    int dns_port = 5353, do_sync = 1, suffix_set = 0;
     uint16_t chain_port = 0;
     char peers[16][96]; int n_peers = 0;
 
@@ -309,7 +311,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-sync")) do_sync = 0;
         else if (!strcmp(argv[i], "--dns-addr") && i+1 < argc) dns_addr = argv[++i];
         else if (!strcmp(argv[i], "--dns-port") && i+1 < argc) dns_port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--suffix")   && i+1 < argc) g_core.suffix = argv[++i];
+        else if (!strcmp(argv[i], "--suffix")   && i+1 < argc) {
+            g_core.suffix = argv[++i];
+            suffix_set = 1;
+        }
         else if (!strcmp(argv[i], "--tls-redirect") && i+1 < argc) {
             if (inet_pton(AF_INET, argv[++i], g_core.tls_redirect_ip) != 1) {
                 fprintf(stderr, "bad --tls-redirect ip '%s'\n", argv[i]); return 1;
@@ -338,9 +343,18 @@ int main(int argc, char **argv) {
             snprintf(peers[n_peers++], sizeof peers[0], "pepenet.shibpost.com:33874");
             snprintf(peers[n_peers++], sizeof peers[0], "net.pepecoin.services:33874");
         } else if (!strcmp(coin, "doge")) {
-            snprintf(peers[n_peers++], sizeof peers[0], "pepenet.shibpost.com:22556");
+            snprintf(peers[n_peers++], sizeof peers[0], "dogenet.shibpost.com:22556");
+            snprintf(peers[n_peers++], sizeof peers[0], "seed.dogecoin.services:22556");
         }
     }
+    /* --suffix wins. Otherwise the coin row names the suffix: pep → pepe,
+     * doge → doge. An unknown coin keeps the compile-time "pepe" default. */
+    if (!suffix_set) {
+        if (!strcmp(coin, "doge")) g_core.suffix = "doge";
+        else if (!strcmp(coin, "pep")) g_core.suffix = "pepe";
+    }
+    uint8_t onchain_magic[2] = { 0, 0 };
+    idx_coin_onchain_magic(coin, onchain_magic);
 
     if (keyarg) {
         if (!load_key(keyarg, g_priv) || !sp_pubkey(g_priv, g_pub)) { fprintf(stderr, "bad --key\n"); return 1; }
@@ -421,9 +435,10 @@ int main(int argc, char **argv) {
     if (dnsd_core_bind(&g_core, dns_addr, dns_port) != 0) g_stop = 1;
 
     if (!g_stop)
-        fprintf(stderr, "dnsd: DNS on %s:%d (udp+%s)  chain listen=%u peers=%d sync=%s  suffix=.%s\n",
+        fprintf(stderr, "dnsd: DNS on %s:%d (udp+%s)  chain listen=%u peers=%d sync=%s  suffix=.%s  magic=%02x%02x\n",
                 dns_addr, dns_port, g_core.tfd >= 0 ? "tcp" : "udp-only",
-                chain_port, n_peers, do_sync ? sync_peer : "off", g_core.suffix);
+                chain_port, n_peers, do_sync ? sync_peer : "off", g_core.suffix,
+                onchain_magic[0], onchain_magic[1]);
 
     while (!g_stop)
         dnsd_core_poll(&g_core, 500);

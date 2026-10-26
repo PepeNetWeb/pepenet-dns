@@ -17,6 +17,10 @@ static int g_fail;
 #define CK(c, m) do { if (c) printf("  ok   %s\n", m); \
                       else { printf("  FAIL %s\n", m); g_fail++; } } while (0)
 
+/* Coin prefixes. PN is the pep row; DN is the doge row. Tests may carry them. */
+static const uint8_t MAG_PN[2] = { 0x50, 0x4E };
+static const uint8_t MAG_DN[2] = { 0x44, 0x4E };
+
 /* ── fake chain: one owner table + deterministic headers ─────────────────────── */
 static uint32_t g_tip = 500;
 static uint8_t g_owner160[20];
@@ -82,13 +86,24 @@ int main(void) {
         zone_rec r; memset(&r, 0, sizeof r);
         snprintf(r.label, sizeof r.label, "www"); r.type = 1; r.ttl = 60;
         r.rdlen = 4; memcpy(r.rdata, rd, 4);
-        uint8_t car[128];
-        int cl = dns_rec_encode(&r, car, sizeof car);
+        uint8_t car[128], dn[128];
+        int cl = dns_rec_encode(&r, MAG_PN, car, sizeof car);
         CK(cl > 0 && cl <= DNS_ONCHAIN_MAX, "on-chain carrier fits 80B");
         CK(car[1] == 'P' && car[2] == 'N', "carrier wears the PN prefix");
         zone_rec r2;
-        CK(dns_rec_decode(car, cl, &r2) && r2.type == 1 && r2.ttl == 60 &&
+        CK(dns_rec_decode(car, cl, MAG_PN, &r2) && r2.type == 1 && r2.ttl == 60 &&
            r2.rdlen == 4 && !strcmp(r2.label, "www"), "carrier decodes");
+        int dnl = dns_rec_encode(&r, MAG_DN, dn, sizeof dn);
+        zone_rec r3;
+        CK(dnl == cl && dn[0] == 0xFF && dn[1] == 'D' && dn[2] == 'N' && dn[3] == car[3] &&
+           memcmp(dn + 4, car + 4, (size_t)(cl - 4)) == 0,
+           "DN twin matches PN except the magic");
+        CK(dns_rec_decode(dn, dnl, MAG_DN, &r3) && r3.type == 1 && r3.ttl == 60 &&
+           r3.rdlen == 4 && !strcmp(r3.label, "www"), "DN carrier round-trips");
+        CK(!dns_rec_decode(dn, dnl, MAG_PN, &r3), "DN payload under the pep profile is ignored");
+        CK(!dns_rec_decode(car, cl, MAG_DN, &r3), "PN payload under the doge profile is ignored");
+        CK(dns_rec_encode(&r, NULL, dn, sizeof dn) < 0, "NULL magic refuses to encode");
+        CK(!dns_rec_decode(car, cl, NULL, &r3), "NULL magic refuses to decode");
     }
 
     printf("-- publish → zone → del → clear --\n");

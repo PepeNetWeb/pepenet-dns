@@ -16,8 +16,10 @@
  *   • gossip (off-chain): an sp_state op — key = label ‖ type_be16, payload =
  *     ttl:var ‖ rdata — signed by the owner key or a §2.2 DNS_SCOPE hot key.
  *   • on-chain (escape hatch): the bare 0xD8 carrier in an OP_RETURN,
- *     0xFF 'P' 'N' 0xD8 ‖ labellen:var label ‖ type:var ‖ ttl:var ‖ rdata,
- *     authenticated by the spend from the owner's address; its ANCHOR is its
+ *     0xFF ‖ magic[2] ‖ 0xD8 ‖ labellen:var label ‖ type:var ‖ ttl:var ‖ rdata.
+ *     magic is the active coin's on-chain prefix (two bytes; the caller passes
+ *     the Coin row). A carrier wearing any other prefix is not a record.
+ *     Authenticated by the spend from the owner's address; its ANCHOR is its
  *     inclusion height — the same ordering axis as the gossiped form. It must
  *     fit DNS_ONCHAIN_MAX to relay permissionlessly. */
 #ifndef DNS_STATE_H
@@ -43,9 +45,12 @@ int  dns_payload_unpack(const uint8_t *p, int plen, uint32_t *ttl,
                         const uint8_t **rdata, int *rdlen);
 
 /* ── on-chain carrier (escape hatch) ────────────────────────────────────────── */
-int  dns_rec_encode(const zone_rec *r, uint8_t *out, int outmax);
-int  dns_rec_decode(const uint8_t *c, int clen, zone_rec *r);
-int  dns_rec_escape_hatchable(const zone_rec *r);
+/* magic is the coin's two-byte prefix (NULL rejects: encode -1, decode 0). */
+int  dns_rec_encode(const zone_rec *r, const uint8_t magic[2],
+                    uint8_t *out, int outmax);
+int  dns_rec_decode(const uint8_t *c, int clen, const uint8_t magic[2],
+                    zone_rec *r);
+int  dns_rec_escape_hatchable(const zone_rec *r, const uint8_t magic[2]);
 
 /* ── publishing (build one op, admit it locally) ────────────────────────────── */
 /* All three anchor at the oracle's tip − SP_STATE_REORG (reorg-safe), sign
