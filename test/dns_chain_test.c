@@ -54,6 +54,44 @@ int main(void) {
     CK(o.owner_now(o.u, "future", out), "tip 12: future (1061) still owned");
     dns_chain_close(c);
 
+    /* reorg: the tip drops back to 10 (rows 11/12 are stale, above tip) — MTP
+     * follows the chain view, not the highest row. heights 1..10: 1000..1090,
+     * n=10, sorted[5] = 1050. */
+    sqlite3_open(path, &db);
+    ex(db, "UPDATE meta SET v='10' WHERE k='height'");
+    sqlite3_close(db);
+    c = dns_chain_open(path); o = dns_chain_oracle(c);
+    CK(!o.owner_now(o.u, "edge", out), "reorg to tip 10: MTP 1050 → edge (1050) lapsed, stale rows above tip ignored");
+    CK(o.owner_now(o.u, "future", out), "reorg to tip 10: future (1061) owned");
+    dns_chain_close(c);
+    /* reorg replaces blocks 9,10 with earlier times: 1000,1005,1006,1010..1070
+     * → sorted[5] = 1030, so a lapsed name becomes owned again on the new branch */
+    sqlite3_open(path, &db);
+    ex(db, "UPDATE blocks SET time=1005 WHERE height=9; UPDATE blocks SET time=1006 WHERE height=10");
+    sqlite3_close(db);
+    c = dns_chain_open(path); o = dns_chain_oracle(c);
+    CK(o.owner_now(o.u, "past", out), "reorg to earlier-time branch: MTP 1030 → past (1040) owned again");
+    CK(o.owner_now(o.u, "edge", out), "reorg to earlier-time branch: edge (1050) owned again");
+    dns_chain_close(c);
+
+    /* fewer than 11 blocks: median of what exists (sorted[n/2]) */
+    sqlite3_open(path, &db);
+    ex(db, "DELETE FROM blocks; INSERT INTO blocks VALUES(1, zeroblob(32), 1000),(2, zeroblob(32), 1060),(3, zeroblob(32), 1030);"
+           "UPDATE meta SET v='3' WHERE k='height'");
+    sqlite3_close(db);
+    c = dns_chain_open(path); o = dns_chain_oracle(c);
+    CK(o.owner_now(o.u, "past", out), "3 blocks (1000,1060,1030): MTP 1030 → past (1040) owned");
+    dns_chain_close(c);
+    sqlite3_open(path, &db); ex(db, "UPDATE meta SET v='2' WHERE k='height'"); sqlite3_close(db);
+    c = dns_chain_open(path); o = dns_chain_oracle(c);
+    CK(!o.owner_now(o.u, "edge", out), "2 blocks (1000,1060): MTP sorted[1]=1060 → edge (1050) lapsed");
+    CK(o.owner_now(o.u, "future", out), "2 blocks: future (1061) owned");
+    dns_chain_close(c);
+    sqlite3_open(path, &db); ex(db, "UPDATE meta SET v='1' WHERE k='height'"); sqlite3_close(db);
+    c = dns_chain_open(path); o = dns_chain_oracle(c);
+    CK(o.owner_now(o.u, "past", out), "1 block (1000): MTP 1000 → past (1040) owned");
+    dns_chain_close(c);
+
     /* no block times at all → fail closed */
     sqlite3_open(path, &db); ex(db, "DELETE FROM blocks"); sqlite3_close(db);
     c = dns_chain_open(path); o = dns_chain_oracle(c);

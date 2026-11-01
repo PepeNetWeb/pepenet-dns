@@ -22,8 +22,8 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wshadow
 
 # ── sibling repos (relative, as the pepenet repo family does) ────────────────
-MESHDIR := ../pepenet-mesh
-IDX     := ../namespace-indexer
+MESHDIR := ../mesh
+IDX     := ../indexer
 
 # the single protocol pin (the indexer's) + its vendored libsecp + secp shim
 SMDIR    := $(IDX)/protocol/impls/c/src
