@@ -20,10 +20,10 @@ int main(void) {
     uint8_t own[20]; memset(own, 7, 20);
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db, "INSERT INTO names VALUES(?,?,?)", -1, &st, 0);
-    const char *nm[3] = { "past", "edge", "future" };
+    const char *nm[4] = { "past", "edge", "future", "mid" };
     /* block times 1000..1100 step 10 at heights 1..11 (not monotone at h=11) */
-    long long ex_[3] = { 1040, 1050, 1061 };
-    for (int i = 0; i < 3; i++) { sqlite3_bind_text(st, 1, nm[i], -1, SQLITE_STATIC);
+    long long ex_[4] = { 1040, 1050, 1061, 1055 };
+    for (int i = 0; i < 4; i++) { sqlite3_bind_text(st, 1, nm[i], -1, SQLITE_STATIC);
         sqlite3_bind_blob(st, 2, own, 20, SQLITE_STATIC); sqlite3_bind_int64(st, 3, ex_[i]);
         sqlite3_step(st); sqlite3_reset(st); }
     sqlite3_finalize(st);
@@ -58,11 +58,14 @@ int main(void) {
      * follows the chain view, not the highest row. heights 1..10: 1000..1090,
      * n=10, sorted[5] = 1050. */
     sqlite3_open(path, &db);
-    ex(db, "UPDATE meta SET v='10' WHERE k='height'");
+    ex(db, "UPDATE meta SET v='10' WHERE k='height'; UPDATE blocks SET time=99999999 WHERE height IN (11,12)");
     sqlite3_close(db);
     c = dns_chain_open(path); o = dns_chain_oracle(c);
     CK(!o.owner_now(o.u, "edge", out), "reorg to tip 10: MTP 1050 → edge (1050) lapsed, stale rows above tip ignored");
     CK(o.owner_now(o.u, "future", out), "reorg to tip 10: future (1061) owned");
+    /* rows 11/12 (stale, far-future times) counted would give heights 2..12 →
+     * sorted[5] = 1060 and lapse "mid"; at tip 10 MTP is 1050 → owned */
+    CK(o.owner_now(o.u, "mid", out) && !memcmp(out, own, 20), "reorg to tip 10: mid (1055) owned at MTP 1050 (lapsed only if stale rows 11-12 were counted)");
     dns_chain_close(c);
     /* reorg replaces blocks 9,10 with earlier times: 1000,1005,1006,1010..1070
      * → sorted[5] = 1030, so a lapsed name becomes owned again on the new branch */
