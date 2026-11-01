@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 struct DnsChain {
     sqlite3      *db;
@@ -14,6 +13,7 @@ struct DnsChain {
     sqlite3_stmt *q_hash;     /* SELECT hash FROM blocks WHERE height=? */
     sqlite3_stmt *q_tip;      /* SELECT v FROM meta WHERE k='height' */
     sqlite3_stmt *q_peer;     /* SELECT v FROM meta WHERE k='peer_height' */
+    sqlite3_stmt *q_times;    /* SELECT time FROM blocks WHERE height<=? (MTP) */
 };
 
 /* Statements prepare LAZILY: on a first boot the indexer may not have created
@@ -50,8 +50,32 @@ void dns_chain_close(DnsChain *c) {
     if (c->q_hash)  sqlite3_finalize(c->q_hash);
     if (c->q_tip)   sqlite3_finalize(c->q_tip);
     if (c->q_peer)  sqlite3_finalize(c->q_peer);
+    if (c->q_times) sqlite3_finalize(c->q_times);
     if (c->db)      sqlite3_close(c->db);
     free(c);
+}
+
+static int cmp_i64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+static uint32_t oc_tip(void *u);
+/* MTP for the block after the tip: median of the <=11 timestamps at heights
+ * <= tip (same as sm_mtp(ts, n) = sorted[n/2]). 1 ok, 0 no block times. */
+static int oc_mtp(DnsChain *c, int64_t *out) {
+    uint32_t tip = oc_tip(c);
+    if (!ensure(c, &c->q_times,
+                "SELECT time FROM blocks WHERE height<=?1 ORDER BY height DESC LIMIT 11")) return 0;
+    int64_t ts[11]; int n = 0;
+    sqlite3_reset(c->q_times);
+    sqlite3_bind_int64(c->q_times, 1, (int64_t)tip);
+    while (n < 11 && sqlite3_step(c->q_times) == SQLITE_ROW)
+        ts[n++] = sqlite3_column_int64(c->q_times, 0);
+    sqlite3_reset(c->q_times);   /* release the read txn */
+    if (n == 0) return 0;
+    qsort(ts, (size_t)n, sizeof ts[0], cmp_i64);
+    *out = ts[n / 2];
+    return 1;
 }
 
 static int oc_owner(void *u, const char *name, uint8_t owner[20]) {
@@ -63,11 +87,13 @@ static int oc_owner(void *u, const char *name, uint8_t owner[20]) {
     if (sqlite3_step(c->q_owner) == SQLITE_ROW &&
         sqlite3_column_bytes(c->q_owner, 0) == 20) {
         int64_t expiry = sqlite3_column_int64(c->q_owner, 1);
-        /* the lease gate. lease_expiry is MTP-denominated (owned iff MTP <
-         * expiry); wall clock ≥ MTP always, so gating on wall clock expires a
-         * name at most ~an hour early — the conservative side, and what the
-         * original chain.c responder pinned. */
-        if (expiry > (int64_t)time(NULL)) {
+        /* the lease gate, on CHAIN time: owned iff MTP < lease_expiry, where
+         * MTP is the median of the <=11 block timestamps at heights <= tip,
+         * i.e. the MTP the indexer's fold uses for the next block (tip+1,
+         * namespace-indexer oracle_for_height/sm_mtp). Never wall clock.
+         * No block times known => unowned (fail closed, like a first boot). */
+        int64_t mtp;
+        if (oc_mtp(c, &mtp) && expiry > mtp) {
             memcpy(owner, sqlite3_column_blob(c->q_owner, 0), 20);
             ok = 1;
         }
