@@ -48,8 +48,16 @@
 #define DNSNET_ANN_REFILL_MS 15000  /* P2: ... then one per 15 s (P1: newest set only) */
 #endif
 #ifndef DNSNET_PULL_PER_PEER
-#define DNSNET_PULL_PER_PEER 32     /* P3: zgets in flight to one peer */
+#define DNSNET_PULL_PER_PEER 4      /* P3: zgets in flight to one peer (PepeNet peers answer 1 per GET_COOL_S) */
 #endif
+#ifndef DNSNET_ZGET_BURST
+#define DNSNET_ZGET_BURST   4       /* P3 pacing: zgets we send one peer at once ... */
+#endif
+#ifndef DNSNET_ZGET_PACE_MS
+#define DNSNET_ZGET_PACE_MS (GET_COOL_S * 1000 + 100)   /* ... then one per its GET_COOL_S */
+#endif
+#define FRESH_CAP   256             /* P3 order: names from small (live-announce) dnzinv frames first */
+#define FRESH_FRAME 4               /* a dnzinv frame of <= this many names counts as live */
 #ifndef DNSNET_PULL_TIMEOUT_S
 #define DNSNET_PULL_TIMEOUT_S 10    /* P3: in-flight zget gives up after this */
 #endif
@@ -95,6 +103,8 @@ typedef struct {
     uint64_t       ann_seq[2];               /* [0] senior ring, [1] junior ring */
     /* P3 */
     int            inflight;
+    int64_t        zget_tok, zget_ms;        /* P3 pacing bucket (x1000) */
+    int            pace_blocked;
 } Peer;
 
 typedef struct {
@@ -121,7 +131,9 @@ static struct {
                       pull_full, defer_name, defer_rec, get_shed, out_wait, ae_names;
     } c, c_logged;
     time_t        next_log;
+    int           nfresh;
 } g;
+static char g_fresh[FRESH_CAP][SP_NAME_MAX + 1];
 
 /* big tables live outside g: dnsnet_init resets their indices, never the
  * contents, so a (test) re-init stays cheap */
@@ -410,6 +422,31 @@ static void ann_service(void) {
     if (any) ring_flush_all();
 }
 
+/* P3 pacing: every PepeNet node (patched or not) answers at most one zget per
+ * peer per GET_COOL_S and silently drops the rest, so sending more than that
+ * only wastes them (and their slots until the timeout). Burst DNSNET_ZGET_BURST,
+ * then one per DNSNET_ZGET_PACE_MS; the clock restarts at each dump received. */
+static int pace_ok(Peer *p) {
+    refill(&p->zget_tok, &p->zget_ms, DNSNET_ZGET_BURST, 1, DNSNET_ZGET_PACE_MS, now_ms());
+    if (p->zget_tok >= 1) return 1;
+    p->pace_blocked = 1;
+    return 0;
+}
+static void pace_take(Peer *p) { if (p->zget_tok > 0) p->zget_tok--; }
+static void pace_answered(Peer *p) {     /* its GET_COOL_S restarted when it answered */
+    int64_t now = now_ms();
+    refill(&p->zget_tok, &p->zget_ms, DNSNET_ZGET_BURST, 1, DNSNET_ZGET_PACE_MS, now);
+    if (p->zget_tok < DNSNET_ZGET_BURST && p->zget_ms < now) p->zget_ms = now;
+}
+/* P3 order: names offered in a small dnzinv frame (a live announce, not an
+ * anti-entropy page) are pulled first, oldest first. Bounded; overflow just
+ * falls back to the normal order. */
+static void fresh_push(const char *name) {
+    for (int i = 0; i < g.nfresh; i++) if (!strcmp(g_fresh[i], name)) return;
+    if (g.nfresh >= FRESH_CAP) return;
+    snprintf(g_fresh[g.nfresh++], SP_NAME_MAX + 1, "%s", name);
+}
+
 /* one zget per (peer, name) per PULL_COOL_S — a digest mismatch that cannot
  * converge (budget-full of different records) used to emit a get every frame. */
 static int pull_ok(Peer *p, const char *name) {
@@ -475,8 +512,10 @@ static void pull_dispatch(PullSlot *s, time_t now) {
             }
         }
         if (p->inflight >= DNSNET_PULL_PER_PEER || !out_room(p, 24 + 1 + SP_NAME_MAX)) { i++; continue; }
+        if (!pace_ok(p)) { i++; continue; }                                /* P3 pacing */
         if (!s->alt[i].force && !pull_ok(p, s->name)) { i++; continue; }   /* per-(peer,name) cooldown */
         send_zget(p, s->name);
+        pace_take(p);
         p->inflight++;
         s->inflight = p; s->sent_at = now;
         memmove(&s->alt[i], &s->alt[i + 1], sizeof s->alt[0] * (size_t)(s->nalt - i - 1)); s->nalt--;
@@ -484,16 +523,19 @@ static void pull_dispatch(PullSlot *s, time_t now) {
     }
     if (!s->nalt) pull_free(s);
 }
-static void pull_want(Peer *from, const char *name, const uint8_t their[32], time_t now) {
+static void pull_want(Peer *from, const char *name, const uint8_t their[32], time_t now, int fresh) {
     PullSlot *s = pull_find(name, 1);
-    if (!s) {                               /* table full: ask directly, unthrottled by P3 */
+    if (!s) {                               /* table full: ask directly (still paced); AE re-offers it */
         g.c.pull_full++;
-        if (out_room(from, 24 + 1 + SP_NAME_MAX) && pull_ok(from, name)) send_zget(from, name);
+        if (out_room(from, 24 + 1 + SP_NAME_MAX) && pace_ok(from) && pull_ok(from, name)) {
+            send_zget(from, name); pace_take(from);
+        }
         return;
     }
     if (s->inflight) g.c.pull_dedup++;
     pull_alt(s, from, their, 0);
     pull_dispatch(s, now);
+    if (fresh && s->name[0] && !s->inflight) fresh_push(name);
 }
 /* a dump for `name` arrived from `from` (solicited or not) */
 static void pull_done(Peer *from, const char *name, int deferred, time_t now, time_t retry_at) {
@@ -504,6 +546,14 @@ static void pull_done(Peer *from, const char *name, int deferred, time_t now, ti
     if (!s->inflight) pull_dispatch(s, now);
 }
 static void pull_service(time_t now) {
+    for (int i = 0; i < g.nfresh; ) {             /* live announces first, oldest first */
+        PullSlot *s = pull_find(g_fresh[i], 0);
+        if (s && !s->inflight) pull_dispatch(s, now);
+        if (!s || !s->name[0] || s->inflight) {
+            memmove(g_fresh[i], g_fresh[i + 1], (size_t)(g.nfresh - i - 1) * sizeof g_fresh[0]);
+            g.nfresh--;
+        } else i++;
+    }
     for (int pass = 0; pass < 2; pass++)          /* P10: senior names get the slots first */
         for (int i = 0; i < PULL_SLOTS; i++) {
             PullSlot *s = &g_pull[i];
@@ -613,6 +663,7 @@ static void on_zinv(Peer *from, const uint8_t *pay, int n) {
     if (!sp_rvar(pay, n, &off, &count)) return;
     if (count > 4096) { strike(from, 20, "zinv count"); return; }
     time_t now = time(NULL);
+    int fresh = count <= FRESH_FRAME;
     for (uint64_t i = 0; i < count; i++) {
         if (off + 1 > n) return;
         int nlen = pay[off++];
@@ -623,7 +674,7 @@ static void on_zinv(Peer *from, const uint8_t *pay, int n) {
         if (!sp_name_valid(name, (size_t)nlen)) continue;
         uint8_t ours[32];
         dns_state_digest(g.st, name, ours);
-        if (memcmp(ours, their, 32) != 0) pull_want(from, name, their, now);
+        if (memcmp(ours, their, 32) != 0) pull_want(from, name, their, now, fresh);
     }
 }
 
@@ -656,7 +707,7 @@ static void on_zdat(Peer *from, const uint8_t *pay, int n) {
     char err[128];
     int owner_strikes = 0;
     time_t now = time(NULL);
-    if (from) ecdsa_refill(from, now);
+    if (from) { ecdsa_refill(from, now); pace_answered(from); }
     uint64_t leftover = 0;
     for (uint64_t i = 0; i < count; i++) {
         uint64_t ol;
@@ -781,6 +832,13 @@ void dnsnet_tick(void) {
         ring_flush_peer(p);
     }
     int64_t ms = now_ms();
+    for (int i = 0; i < MAX_PEERS; i++) {          /* a paced peer's next token is due */
+        Peer *p = &g.peers[i];
+        if (p->used && p->pace_blocked) {
+            refill(&p->zget_tok, &p->zget_ms, DNSNET_ZGET_BURST, 1, DNSNET_ZGET_PACE_MS, ms);
+            if (p->zget_tok >= 1) { p->pace_blocked = 0; g.pull_kick = 1; }
+        }
+    }
     if (g.pull_kick && ms - g.last_pull_ms >= 100) {   /* a pull slot freed: refill soon */
         g.pull_kick = 0; g.last_pull_ms = ms;
         pull_service(now);
