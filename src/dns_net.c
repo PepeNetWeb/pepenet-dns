@@ -48,10 +48,10 @@
 #define DNSNET_ANN_REFILL_MS 15000  /* P2: ... then one per 15 s (P1: newest set only) */
 #endif
 #ifndef DNSNET_PULL_PER_PEER
-#define DNSNET_PULL_PER_PEER 1      /* P3: zgets in flight to one peer (PepeNet peers answer 1 per GET_COOL_S, drop the rest) */
+#define DNSNET_PULL_PER_PEER 2      /* P3: zgets in flight to one peer (PepeNet peers answer 1 per GET_COOL_S, drop the rest) */
 #endif
 #ifndef DNSNET_ZGET_BURST
-#define DNSNET_ZGET_BURST   1       /* P3 pacing: one zget to a peer at a time ... */
+#define DNSNET_ZGET_BURST   2       /* P3 pacing: zgets we send one peer at once ... */
 #endif
 #ifndef DNSNET_ZGET_PACE_MS
 #define DNSNET_ZGET_PACE_MS (GET_COOL_S * 1000 + 100)   /* ... then one per its GET_COOL_S */
@@ -537,6 +537,21 @@ static void pull_want(Peer *from, const char *name, const uint8_t their[32], tim
     pull_dispatch(s, now);
     if (fresh && s->name[0] && !s->inflight) fresh_push(name);
 }
+/* A dump from `from` means its GET_COOL_S restarted, so any OTHER zget we had
+ * in flight to it was dropped there (PepeNet answers one per GET_COOL_S and
+ * drops the rest, silently). Release those now instead of waiting for the
+ * timeout and ask again (force: its per-(peer,name) cooldown was spent on a
+ * zget that was never answered). */
+static void pull_reap(Peer *from, const char *answered) {
+    if (!from || from->inflight <= 0) return;
+    for (int i = 0; i < PULL_SLOTS && from->inflight > 0; i++) {
+        PullSlot *s = &g_pull[i];
+        if (!s->name[0] || s->inflight != from || !strcmp(s->name, answered)) continue;
+        s->inflight = NULL; from->inflight--;
+        pull_alt(s, from, NULL, 1);
+        g.pull_kick = 1;
+    }
+}
 /* a dump for `name` arrived from `from` (solicited or not) */
 static void pull_done(Peer *from, const char *name, int deferred, time_t now, time_t retry_at) {
     PullSlot *s = pull_find(name, deferred);
@@ -747,6 +762,7 @@ static void on_zdat(Peer *from, const uint8_t *pay, int n) {
                     (unsigned long long)leftover);
         }
     }
+    pull_reap(from, name);
     pull_done(from, name, deferred, now, retry_at);
     if (changed) {
         /* announce to everyone — including the source: if we also hold ops it
