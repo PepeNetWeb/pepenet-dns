@@ -19,6 +19,20 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* TCP DNS clients, served NON-BLOCKING from dnsd_core_poll so a slow, idle or
+ * trickling client can never stall the UDP path. Zero-initialised = no client.
+ * Bounds: DNSD_TCP_MAX clients total, DNSD_TCP_PER_IP per IPv4 source, each
+ * with an absolute lifetime and an idle clock (see dnsd_core.c). */
+#define DNSD_TCP_MAX   16
+#define DNSD_TCP_QMAX  4096            /* largest query accepted over TCP */
+typedef struct {
+    int      used, fd;
+    uint32_t ip;                       /* peer IPv4, network order (per-IP cap) */
+    int64_t  born_ms, last_ms;         /* monotonic: accept time, last byte in/out */
+    uint8_t  in[2 + DNSD_TCP_QMAX]; size_t in_len;
+    uint8_t *out; size_t out_len, out_off;   /* pending length-prefixed answer */
+} DnsdTcpConn;
+
 typedef struct {
     /* caller-owned read handles (open your own connections; WAL-safe) */
     SpState      *st;               /* the record store */
@@ -29,14 +43,17 @@ typedef struct {
     int         verbose;
     /* sockets (dnsd_core_bind) */
     int         ufd, tfd;           /* -1 when unbound / tcp unavailable */
+    DnsdTcpConn tcp[DNSD_TCP_MAX];  /* live TCP clients (core-internal) */
 } DnsdCore;
 
 /* Bind UDP + TCP on addr:port. TCP failure is tolerated (UDP-only, tfd = -1);
  * UDP failure is not. Returns 0 ok, -1 on error. */
 int  dnsd_core_bind(DnsdCore *dc, const char *addr, int port);
 
-/* One poll iteration: wait ≤ timeout_ms, service one UDP datagram and/or one
- * TCP client. Returns the number of transports serviced (0 on timeout). */
+/* One poll iteration: wait ≤ timeout_ms, service one UDP datagram and any
+ * ready TCP clients (accept / read / answer / write, all non-blocking), then
+ * expire TCP clients past their deadlines. Never blocks beyond timeout_ms.
+ * Returns the number of transports serviced (0 on timeout). */
 int  dnsd_core_poll(DnsdCore *dc, int timeout_ms);
 
 void dnsd_core_close(DnsdCore *dc);

@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -135,42 +138,118 @@ static void serve_udp(DnsdCore *dc) {
     if (rn) sendto(dc->ufd, out, rn, 0, (struct sockaddr *)&cli, cl);
 }
 
-static int io_full(int fd, uint8_t *p, size_t n, int writing) {
-    size_t done = 0;
-    while (done < n) {
-        ssize_t r = writing ? write(fd, p + done, n - done)
-                            : read(fd, p + done, n - done);
-        if (r == 0) return -1;                              /* EOF */
-        if (r < 0) { if (errno == EINTR) continue; return -1; }  /* timeout/error */
-        done += (size_t)r;
+/* ── TCP (RFC 7766), non-blocking ─────────────────────────────────────────────
+ * The resolver thread also answers UDP, so TCP must never block it. The old
+ * inline loop (3 s SO_RCVTIMEO per read, served until EOF) let ONE client that
+ * sent a query every <3 s — or trickled bytes, or merely connected and idled —
+ * starve every UDP query for as long as it liked. Now each client is a slot in
+ * dc->tcp polled alongside the UDP socket:
+ *   DNSD_TCP_MAX    16 clients total; DNSD_TCP_PER_IP 2 per IPv4 source
+ *                   (over the cap: accepted and closed at once, backlog drains)
+ *   TCP_IDLE_MS     3 s without a byte in or out (the old per-read timeout)
+ *   TCP_LIFE_MS     10 s absolute per connection, however chatty — plenty for
+ *                   a stub's TC-fallback retry or a short pipeline (RFC 7766
+ *                   lets servers close idle/long conns; clients reconnect)
+ * Queries over DNSD_TCP_QMAX (4096) bytes close the conn; real queries are a
+ * few hundred bytes. Answers are queued per client and written as the socket
+ * drains; a client that stops reading hits the idle/life clock. Footprint:
+ * ~66 KB of slots + one answer buffer per busy client; no threads. */
+#define TCP_IDLE_MS 3000
+#define TCP_LIFE_MS 10000
+#ifndef DNSD_TCP_PER_IP
+#define DNSD_TCP_PER_IP 2
+#endif
+#ifdef MSG_NOSIGNAL
+#define TCP_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define TCP_SEND_FLAGS 0
+#endif
+
+static int64_t core_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static int would_block(void) { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
+
+static void tcp_close(DnsdTcpConn *t) {
+    if (t->fd >= 0) close(t->fd);
+    free(t->out);
+    memset(t, 0, sizeof *t);
+}
+
+static void tcp_accept(DnsdCore *dc) {
+    for (int k = 0; k < 8; k++) {                       /* drain a burst, bounded */
+        struct sockaddr_in sa; socklen_t sl = sizeof sa;
+        int c = accept(dc->tfd, (struct sockaddr *)&sa, &sl);
+        if (c < 0) return;
+        uint32_t ip = sl >= (socklen_t)sizeof sa ? sa.sin_addr.s_addr : 0;
+        int slot = -1, same = 0;
+        for (int i = 0; i < DNSD_TCP_MAX; i++) {
+            if (!dc->tcp[i].used) { if (slot < 0) slot = i; }
+            else if (dc->tcp[i].ip == ip) same++;
+        }
+        if (slot < 0 || same >= DNSD_TCP_PER_IP) { close(c); continue; }
+        int fl = fcntl(c, F_GETFL, 0);
+        if (fl < 0 || fcntl(c, F_SETFL, fl | O_NONBLOCK) != 0) { close(c); continue; }
+        DnsdTcpConn *t = &dc->tcp[slot];
+        memset(t, 0, sizeof *t);
+        t->used = 1; t->fd = c; t->ip = ip;
+        t->born_ms = t->last_ms = core_ms();
+    }
+}
+
+/* write what the socket takes; 0 = keep, -1 = close */
+static int tcp_flush(DnsdTcpConn *t) {
+    while (t->out && t->out_off < t->out_len) {
+        ssize_t w = send(t->fd, t->out + t->out_off, t->out_len - t->out_off, TCP_SEND_FLAGS);
+        if (w < 0) return would_block() ? 0 : -1;
+        if (w == 0) return -1;
+        t->out_off += (size_t)w; t->last_ms = core_ms();
+    }
+    free(t->out); t->out = NULL; t->out_len = t->out_off = 0;
+    return 0;
+}
+
+/* answer every complete buffered query, one at a time (each answer must drain
+ * before the next is built); 0 = keep, -1 = close */
+static int tcp_answer(DnsdCore *dc, DnsdTcpConn *t) {
+    static uint8_t out[65536];
+    while (!t->out && t->in_len >= 2) {
+        size_t mlen = ((size_t)t->in[0] << 8) | t->in[1];
+        if (mlen == 0 || mlen > DNSD_TCP_QMAX) return -1;
+        if (t->in_len < 2 + mlen) break;
+        dns_query q;
+        if (dns_parse_query(t->in + 2, mlen, &q) != 0) return -1;
+        size_t rn = dnsd_core_answer(dc, &q, out, sizeof out, 1);
+        if (rn == 0 || rn > 65535) return -1;
+        t->out = malloc(rn + 2);
+        if (!t->out) return -1;
+        t->out[0] = (uint8_t)(rn >> 8); t->out[1] = (uint8_t)rn;
+        memcpy(t->out + 2, out, rn); t->out_len = rn + 2; t->out_off = 0;
+        memmove(t->in, t->in + 2 + mlen, t->in_len - 2 - mlen); t->in_len -= 2 + mlen;
+        if (tcp_flush(t) != 0) return -1;
     }
     return 0;
 }
 
-/* One TCP client: length-prefixed messages (RFC 7766), served until EOF/timeout.
- * Handled inline on the caller's thread — fine for a low-volume authoritative
- * mirror; a short recv timeout keeps a stalled peer from wedging the UDP path. */
-static void serve_tcp(DnsdCore *dc) {
-    int c = accept(dc->tfd, NULL, NULL);
-    if (c < 0) return;
-    struct timeval tv = { 3, 0 };
-    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    for (;;) {
-        uint8_t lenb[2];
-        if (io_full(c, lenb, 2, 0) != 0) break;
-        size_t mlen = ((size_t)lenb[0] << 8) | lenb[1];
-        if (mlen == 0 || mlen > 65535) break;
-        static uint8_t req[65536], out[65536];
-        if (io_full(c, req, mlen, 0) != 0) break;
-        dns_query q;
-        if (dns_parse_query(req, mlen, &q) != 0) break;
-        size_t rn = dnsd_core_answer(dc, &q, out, sizeof out, 1);
-        if (rn == 0) break;
-        uint8_t olen[2] = { (uint8_t)(rn >> 8), (uint8_t)rn };
-        if (io_full(c, olen, 2, 1) != 0 || io_full(c, out, rn, 1) != 0) break;
+static void tcp_service(DnsdCore *dc, DnsdTcpConn *t, short rev) {
+    if ((rev & POLLOUT) && tcp_flush(t) != 0) { tcp_close(t); return; }
+    if (rev & (POLLIN | POLLHUP | POLLERR)) {
+        if (t->in_len < sizeof t->in) {
+            ssize_t r = recv(t->fd, t->in + t->in_len, sizeof t->in - t->in_len, 0);
+            if (r == 0 || (r < 0 && !would_block())) { tcp_close(t); return; }
+            if (r > 0) { t->in_len += (size_t)r; t->last_ms = core_ms(); }
+        } else if (rev & (POLLHUP | POLLERR)) { tcp_close(t); return; }
     }
-    close(c);
+    if (tcp_answer(dc, t) != 0) tcp_close(t);
+}
+
+static void tcp_expire(DnsdCore *dc, int64_t now) {
+    for (int i = 0; i < DNSD_TCP_MAX; i++) {
+        DnsdTcpConn *t = &dc->tcp[i];
+        if (t->used && (now - t->born_ms >= TCP_LIFE_MS || now - t->last_ms >= TCP_IDLE_MS))
+            tcp_close(t);
+    }
 }
 
 /* ── lifecycle ───────────────────────────────────────────────────────────────── */
@@ -198,22 +277,53 @@ int dnsd_core_bind(DnsdCore *dc, const char *addr, int port) {
     setsockopt(dc->tfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     if (bind(dc->tfd, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(dc->tfd, 16) < 0) {
         perror("bind dns/tcp"); close(dc->tfd); dc->tfd = -1;   /* UDP-only fallback */
+    } else {
+        int fl = fcntl(dc->tfd, F_GETFL, 0);                  /* accept must never block */
+        if (fl < 0 || fcntl(dc->tfd, F_SETFL, fl | O_NONBLOCK) != 0) {
+            perror("dns/tcp nonblock"); close(dc->tfd); dc->tfd = -1;
+        }
     }
+    for (int i = 0; i < DNSD_TCP_MAX; i++) dc->tcp[i].used = 0;
     return 0;
 }
 
 int dnsd_core_poll(DnsdCore *dc, int timeout_ms) {
     if (dc->ufd < 0) return 0;
-    struct pollfd pfd[2] = { { dc->ufd, POLLIN, 0 }, { dc->tfd, POLLIN, 0 } };
-    int nf = dc->tfd >= 0 ? 2 : 1;
-    if (poll(pfd, nf, timeout_ms) <= 0) return 0;
+    struct pollfd pfd[2 + DNSD_TCP_MAX]; int map[2 + DNSD_TCP_MAX]; int nf = 0;
+    pfd[nf].fd = dc->ufd; pfd[nf].events = POLLIN; pfd[nf].revents = 0; map[nf++] = -1;
+    if (dc->tfd >= 0) { pfd[nf].fd = dc->tfd; pfd[nf].events = POLLIN; pfd[nf].revents = 0; map[nf++] = -2; }
+    int64_t now = core_ms(), next = -1;
+    for (int i = 0; i < DNSD_TCP_MAX; i++) {
+        DnsdTcpConn *t = &dc->tcp[i];
+        if (!t->used) continue;
+        short ev = 0;
+        if (t->in_len < sizeof t->in) ev |= POLLIN;
+        if (t->out) ev |= POLLOUT;
+        pfd[nf].fd = t->fd; pfd[nf].events = ev; pfd[nf].revents = 0; map[nf++] = i;
+        int64_t d1 = t->born_ms + TCP_LIFE_MS, d2 = t->last_ms + TCP_IDLE_MS;
+        int64_t d = d1 < d2 ? d1 : d2;
+        if (next < 0 || d < next) next = d;
+    }
+    int wait = timeout_ms;                               /* wake for the next expiry */
+    if (next >= 0) { int64_t left = next - now; if (left < 0) left = 0; if (wait < 0 || left < wait) wait = (int)left; }
+    int pr = poll(pfd, (nfds_t)nf, wait);
     int served = 0;
-    if (pfd[0].revents & POLLIN) { serve_udp(dc); served++; }
-    if (dc->tfd >= 0 && (pfd[1].revents & POLLIN)) { serve_tcp(dc); served++; }
+    if (pr > 0) {
+        for (int k = 0; k < nf; k++) {
+            if (!pfd[k].revents) continue;
+            if (map[k] == -1) { if (pfd[k].revents & POLLIN) { serve_udp(dc); served++; } }
+            else if (map[k] == -2) { if (pfd[k].revents & POLLIN) { tcp_accept(dc); served++; } }
+            else if (dc->tcp[map[k]].used && dc->tcp[map[k]].fd == pfd[k].fd) {
+                tcp_service(dc, &dc->tcp[map[k]], pfd[k].revents); served++;
+            }
+        }
+    }
+    tcp_expire(dc, core_ms());
     return served;
 }
 
 void dnsd_core_close(DnsdCore *dc) {
+    for (int i = 0; i < DNSD_TCP_MAX; i++) if (dc->tcp[i].used) tcp_close(&dc->tcp[i]);
     if (dc->ufd >= 0) close(dc->ufd);
     if (dc->tfd >= 0) close(dc->tfd);
     dc->ufd = dc->tfd = -1;

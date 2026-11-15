@@ -99,8 +99,11 @@ $(NETLIB):
 state_dns_test: $(TEST_SRC) $(wildcard src/*.h) $(NETLIB) $(IDXSECP)
 	$(CC) $(CFLAGS) $(INC_TEST) -o $@ $(TEST_SRC) $(NETLIB) $(IDXSECP) -lsqlite3
 
-check: state_dns_test
+# check also runs the TCP slow-loris liveness test against the built dnsd
+# (loopback; run under `unshare -rn`, the test brings lo up itself).
+check: state_dns_test dnsd
 	./state_dns_test
+	python3 test/tcp_loris_test.py ./dnsd pepe
 
 clean:
 	rm -rf build dnsd dns-cli state_dns_test
