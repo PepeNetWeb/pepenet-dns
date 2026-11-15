@@ -48,10 +48,10 @@
 #define DNSNET_ANN_REFILL_MS 15000  /* P2: ... then one per 15 s (P1: newest set only) */
 #endif
 #ifndef DNSNET_PULL_PER_PEER
-#define DNSNET_PULL_PER_PEER 4      /* P3: zgets in flight to one peer (PepeNet peers answer 1 per GET_COOL_S) */
+#define DNSNET_PULL_PER_PEER 1      /* P3: zgets in flight to one peer (PepeNet peers answer 1 per GET_COOL_S, drop the rest) */
 #endif
 #ifndef DNSNET_ZGET_BURST
-#define DNSNET_ZGET_BURST   4       /* P3 pacing: zgets we send one peer at once ... */
+#define DNSNET_ZGET_BURST   1       /* P3 pacing: one zget to a peer at a time ... */
 #endif
 #ifndef DNSNET_ZGET_PACE_MS
 #define DNSNET_ZGET_PACE_MS (GET_COOL_S * 1000 + 100)   /* ... then one per its GET_COOL_S */
