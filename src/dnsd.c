@@ -11,7 +11,7 @@
  *   • net thread  — dns_net + idx_serve: listen on the chain port (a public
  *     seed) and/or dial --peer chain peers, and gossip zones as dnz* commands
  *     over every "/pepenet-" connection. Owns the write store; services the
- *     ctl socket + startup publish + the daily expiry sweep in the mesh tick.
+ *     ctl socket + startup publish + the resumable expiry sweep in the mesh tick.
  *   • main thread — the UDP/TCP DNS resolver (dnsd_core), separate read handles
  *     (sqlite WAL makes concurrent read-while-write safe).
  *
@@ -201,21 +201,45 @@ static void mesh_down(void *ud, void *handle) {
     (void)ud;
     dnsnet_down(handle);
 }
+/* P10: a name whose current ownership epoch is >= ~30 days old (1-minute
+ * blocks) is senior: under backlog its announces and pulls go first. A name
+ * with no live owner is never senior; an owned name with no epochs row has
+ * been owned since before the projection began, so it counts as senior. */
+#define SENIOR_BLOCKS (30 * 1440)
+static int name_senior(const char *name) {
+    uint8_t owner[20];
+    if (!g_orc.owner_now(g_orc.u, name, owner)) return 0;
+    int64_t start = dns_chain_epoch_start(g_ch, name);
+    if (start < 0) return 1;
+    uint32_t tip = g_orc.tip(g_orc.u);
+    return (int64_t)tip - start >= SENIOR_BLOCKS;
+}
+
+/* P11: the expiry sweep runs as a resumable step every SWEEP_EVERY_S, each
+ * step looking at up to SWEEP_STEP names after where the last one stopped. */
+#ifndef SWEEP_EVERY_S
+#define SWEEP_EVERY_S 600
+#endif
+#ifndef SWEEP_STEP
+#define SWEEP_STEP 4096
+#endif
 static void mesh_tick(void *ud) {
     (void)ud;
     static int published = 0;
     static time_t next_sweep = 0;
+    static char sweep_cursor[SP_NAME_MAX + 1];
     if (!published && g_have_zone && g_have_key) { publish_zone_once(); published = 1; }
     service_ctl();
     dnsnet_tick();
-    /* expiry sweep (~daily): a name whose lease lapsed on chain takes its
-       records with it — this replaces the old store TTL entirely. */
+    /* expiry sweep: a name whose lease lapsed on chain takes its records with
+       it — this replaces the old store TTL entirely. */
     time_t now = time(NULL);
-    if (!next_sweep) next_sweep = now + 86400;
+    if (!next_sweep) next_sweep = now + SWEEP_EVERY_S;
     if (now >= next_sweep) {
-        next_sweep = now + 86400;
-        int n = dns_state_sweep(g_st, &g_orc);
-        if (n && g_verbose) fprintf(stderr, "dnsd: sweep dropped %d lapsed name(s)\n", n);
+        next_sweep = now + SWEEP_EVERY_S;
+        int seen = 0;
+        int n = dns_state_sweep_step(g_st, &g_orc, sweep_cursor, SWEEP_STEP, &seen);
+        if (n && g_verbose) fprintf(stderr, "dnsd: sweep dropped %d lapsed name(s) of %d examined\n", n, seen);
     }
 }
 
@@ -228,6 +252,7 @@ static void *net_main(void *a) {
     if (!g_ch || !g_st) { fprintf(stderr, "dnsd: cannot open db/store\n"); g_stop = 1; return NULL; }
     g_orc = dns_chain_oracle(g_ch);
     dnsnet_init(g_st, g_orc, g_verbose);
+    dnsnet_set_seniority(name_senior);
 
     IdxMeshHooks mesh = { mesh_up, mesh_msg, mesh_down, mesh_tick, NULL, serve_conn_misbehave };
     dnsnet_set_misbehave(serve_conn_misbehave);

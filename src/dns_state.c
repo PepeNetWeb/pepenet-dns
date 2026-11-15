@@ -215,25 +215,63 @@ void dns_state_digest(SpState *st, const char *name, uint8_t out[32]) {
     sp_sha256(a.buf, (size_t)a.off, out);
 }
 
+/* G1: the zone as served. Rows belong to the ownership epoch they were
+ * admitted under (st_names.owner); if the name has changed hands since and the
+ * new owner has not published yet, those rows are the PREVIOUS owner's and are
+ * not served (the wipe still happens on the new owner's first admitted op). */
+int dns_state_zone_owned(SpState *st, const char *name, const uint8_t owner[20], zone *z) {
+    uint8_t held[20];
+    if (sp_state_owner(st, name, held) && memcmp(held, owner, 20) != 0) {
+        memset(z, 0, sizeof *z);
+        size_t nlen = name ? strlen(name) : 0;
+        if (sp_name_valid(name, nlen)) snprintf(z->apex, sizeof z->apex, "%s", name);
+        return 0;
+    }
+    return dns_state_zone(st, name, z);
+}
+
 /* ── sweep ──────────────────────────────────────────────────────────────────── */
-typedef struct { char names[256][SP_NAME_MAX + 1]; int n; } SweepAcc;
+/* P11: a resumable sweep. Each step examines up to `max` names after `cursor`
+ * (name order) and drops the ones the oracle no longer answers for; the cursor
+ * wraps to "" at the end of the store, so successive steps visit every name.
+ * (The old pass collected the first 256 names every time and never got past
+ * them.) Names are collected first, then dropped, so the walk is not mutated
+ * under its own cursor. */
+#define SWEEP_CHUNK 256
+typedef struct { char names[SWEEP_CHUNK][SP_NAME_MAX + 1]; int n; } SweepAcc;
 
 static int sweep_cb(void *u, const char *name) {
     SweepAcc *a = u;
-    if (a->n >= 256) return 0;             /* next daily pass gets the rest */
+    if (a->n >= SWEEP_CHUNK) return 0;
     snprintf(a->names[a->n++], SP_NAME_MAX + 1, "%s", name);
     return 1;
 }
 
-int dns_state_sweep(SpState *st, const SpChainOracle *o) {
-    SweepAcc a; a.n = 0;
-    sp_state_names(st, sweep_cb, &a);
-    int dropped = 0;
+int dns_state_sweep_step(SpState *st, const SpChainOracle *o, char *cursor,
+                         int max, int *examined) {
+    static SweepAcc a;                     /* 8.5 KB; single owner (net thread) */
+    int dropped = 0, seen = 0;
     uint8_t owner[20];
-    for (int i = 0; i < a.n; i++)
-        if (!o->owner_now(o->u, a.names[i], owner)) {
-            sp_state_drop_name(st, a.names[i]);
-            dropped++;
-        }
+    while (seen < max) {
+        int want = max - seen < SWEEP_CHUNK ? max - seen : SWEEP_CHUNK;
+        a.n = 0;
+        sp_state_names_after(st, cursor, want, sweep_cb, &a);
+        for (int i = 0; i < a.n; i++)
+            if (!o->owner_now(o->u, a.names[i], owner)) {
+                sp_state_drop_name(st, a.names[i]);
+                dropped++;
+            }
+        seen += a.n;
+        if (a.n < want) { cursor[0] = '\0'; break; }   /* end of store: wrap */
+        snprintf(cursor, SP_NAME_MAX + 1, "%s", a.names[a.n - 1]);
+    }
+    if (examined) *examined = seen;
+    return dropped;
+}
+
+int dns_state_sweep(SpState *st, const SpChainOracle *o) {
+    char cur[SP_NAME_MAX + 1] = "";
+    int dropped = 0, seen;
+    do { dropped += dns_state_sweep_step(st, o, cur, 4096, &seen); } while (cur[0]);
     return dropped;
 }

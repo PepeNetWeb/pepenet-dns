@@ -23,5 +23,8 @@ SpChainOracle dns_chain_oracle(DnsChain *c);
 /* this node's fold height and the last peer tip persisted by the indexer
  * (0 if unknown). WAL-safe read; used by the tls fail-closed page. */
 void          dns_chain_sync(DnsChain *c, int64_t *height, int64_t *peer_height);
+/* start height of `name`'s current ownership epoch (indexer epochs table), -1
+ * if unknown. Read-only; used for the overlay's seniority priority. */
+int64_t       dns_chain_epoch_start(DnsChain *c, const char *name);
 
 #endif /* DNS_CHAIN_H */

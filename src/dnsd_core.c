@@ -88,7 +88,7 @@ size_t dnsd_core_answer(DnsdCore *dc, const dns_query *q,
                 q->qname, apex, sub[0] ? sub : "@", owned, q->edns, over_tcp);
     if (!owned) { resp_start(&r, out, cap, limit, q, DNS_RCODE_NXDOMAIN); goto done; }
 
-    zone z; dns_state_zone(dc->st, apex, &z);
+    zone z; dns_state_zone_owned(dc->st, apex, owner, &z);   /* G1: current owner's rows only */
     resp_start(&r, out, cap, limit, q, DNS_RCODE_NOERROR);
 
     /* TLS interception: for an A (or ANY) query on a DANE-enabled name, answer

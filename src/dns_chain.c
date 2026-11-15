@@ -14,6 +14,7 @@ struct DnsChain {
     sqlite3_stmt *q_hash;     /* SELECT hash FROM blocks WHERE height=? */
     sqlite3_stmt *q_tip;      /* SELECT v FROM meta WHERE k='height' */
     sqlite3_stmt *q_peer;     /* SELECT v FROM meta WHERE k='peer_height' */
+    sqlite3_stmt *q_epoch;    /* SELECT MAX(start_height) FROM epochs WHERE name=? */
 };
 
 /* Statements prepare LAZILY: on a first boot the indexer may not have created
@@ -50,6 +51,7 @@ void dns_chain_close(DnsChain *c) {
     if (c->q_hash)  sqlite3_finalize(c->q_hash);
     if (c->q_tip)   sqlite3_finalize(c->q_tip);
     if (c->q_peer)  sqlite3_finalize(c->q_peer);
+    if (c->q_epoch) sqlite3_finalize(c->q_epoch);
     if (c->db)      sqlite3_close(c->db);
     free(c);
 }
@@ -125,4 +127,15 @@ void dns_chain_sync(DnsChain *c, int64_t *height, int64_t *peer_height) {
     if (!c) return;
     if (height)      *height = meta_i64(c, &c->q_tip,  "SELECT v FROM meta WHERE k='height'");
     if (peer_height) *peer_height = meta_i64(c, &c->q_peer, "SELECT v FROM meta WHERE k='peer_height'");
+}
+
+int64_t dns_chain_epoch_start(DnsChain *c, const char *name) {
+    int64_t h = -1;
+    if (!c || !ensure(c, &c->q_epoch, "SELECT MAX(start_height) FROM epochs WHERE name=?1")) return -1;
+    sqlite3_reset(c->q_epoch);
+    sqlite3_bind_text(c->q_epoch, 1, name, -1, SQLITE_STATIC);
+    if (sqlite3_step(c->q_epoch) == SQLITE_ROW && sqlite3_column_type(c->q_epoch, 0) != SQLITE_NULL)
+        h = sqlite3_column_int64(c->q_epoch, 0);
+    sqlite3_reset(c->q_epoch);   /* release the read txn */
+    return h;
 }

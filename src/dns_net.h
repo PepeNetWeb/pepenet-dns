@@ -38,6 +38,10 @@ void  dnsnet_announce(const char *name);
 /* Overlay → serve score hook. NULL-checked. `peer` is the SConn* from dnsnet_up. */
 void  dnsnet_set_misbehave(void (*fn)(void *peer, int score, const char *why));
 
+/* Optional P10 hook: 1 if `name`'s current ownership epoch is senior (older
+ * owners first under backlog). NULL (default) = everyone is senior. */
+void  dnsnet_set_seniority(int (*fn)(const char *name));
+
 /* live peer count (status surfaces) */
 int   dnsnet_peers(void);
 

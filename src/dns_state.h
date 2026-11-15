@@ -83,8 +83,19 @@ int  dns_state_zone(SpState *st, const char *name, zone *z);
  * order). Equal digests ⇒ equal held state for the name. */
 void dns_state_digest(SpState *st, const char *name, uint8_t out[32]);
 
+/* The zone as served for the CURRENT owner `owner`: empty (returns 0) when the
+ * held rows were admitted under a different owner (a transfer whose new owner
+ * has not published yet — they are the previous owner's records). */
+int  dns_state_zone_owned(SpState *st, const char *name, const uint8_t owner[20], zone *z);
+
 /* Expiry sweep: drop every stored name the oracle no longer answers for
- * (lease lapsed / never owned). Returns how many names were dropped. */
+ * (lease lapsed / never owned). Returns how many names were dropped. Walks
+ * the whole store. */
 int  dns_state_sweep(SpState *st, const SpChainOracle *o);
+/* One resumable step of the same sweep: up to `max` names after `cursor`
+ * ("" = start; wraps back to "" at the end). Returns names dropped; *examined
+ * (may be NULL) = names looked at. */
+int  dns_state_sweep_step(SpState *st, const SpChainOracle *o, char *cursor /* >= 33 B */,
+                          int max, int *examined);
 
 #endif /* DNS_STATE_H */
