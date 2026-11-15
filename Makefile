@@ -167,3 +167,14 @@ check-gossip: net_test
 	./net_test
 
 .PHONY: check-gossip
+
+# local anti-spam limits (P1-P4, P6, P8, P10, P11, G1) on a fake clock
+antispam_test: test/antispam_test.c src/dns_net.c $(wildcard src/*.h) $(NETLIB) $(IDXSECP)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC_TEST) -Dtime=ft_time -DDNSNET_TEST_CLOCK_MS=ft_ms -c src/dns_net.c -o build/antispam_dns_net.o
+	$(CC) $(CFLAGS) $(INC_TEST) -o $@ test/antispam_test.c build/antispam_dns_net.o src/dns_state.c src/zone.c src/dns_wire.c $(NETLIB) $(IDXSECP) -lsqlite3
+
+check-antispam: antispam_test
+	./antispam_test
+
+.PHONY: check-antispam
