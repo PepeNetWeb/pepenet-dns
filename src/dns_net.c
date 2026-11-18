@@ -50,7 +50,8 @@
  *     jump counts every phase height crossed (capped at the burst).
  *     Under backlog, names that were quiet longest (in
  *     blocks) go first: five stale-first lanes replace P10's senior ring.
- * L3  pulls are dispatched by (lane, live-announce, waiting time); a quiet
+ * L3  pulls are dispatched by (lane, live-announce, waiting time; a live pull
+ *     takes the front of the overflow FIFO or bumps a waiting AE pull); a quiet
  *     name's zget that lands inside GET_COOL_S is remembered (one per peer)
  *     and answered when the cooldown ends, instead of dropped (rate unchanged:
  *     still one dump per peer per GET_COOL_S).
@@ -883,14 +884,33 @@ static int povf_push(int q, const PullOvf *e, int front) {
     g_povf_n[q]++;
     return 1;
 }
+/* a live pull found its probe window full: move one waiting (not in flight)
+ * AE pull from that window to the back of the bounded overflow FIFO */
+static PullSlot *pull_bump(const char *name) {
+    uint64_t h = hname(name, NULL, 0);
+    for (int i = 0; i < PULL_PROBE; i++) {
+        PullSlot *v = &g_pull[(h + (uint64_t)i) % PULL_SLOTS];
+        if (!v->name[0] || v->inflight || v->fresh || v->nalt < 1) continue;
+        PullOvf e; memset(&e, 0, sizeof e);
+        Peer *p = v->alt[v->nalt - 1].p;
+        snprintf(e.name, sizeof e.name, "%s", v->name);
+        e.pi = (int)(p - g.peers); e.gen = p->gen; memcpy(e.dg, v->alt[v->nalt - 1].dg, 32);
+        if (povf_push(v->lane <= LANE_HI ? 0 : 1, &e, 0)) g.c.pull_ovf++;
+        else g.c.pull_ovf_drop++;                  /* AE re-offers it later */
+        pull_free(v);
+        return pull_find(name, 1);
+    }
+    return NULL;
+}
 static void pull_want(Peer *from, const char *name, const uint8_t their[32], time_t now, int fresh) {
     PullSlot *s = pull_find(name, 1);
+    if (!s && fresh) s = pull_bump(name);
     if (!s) {
         g.c.pull_full++;
         PullOvf e; memset(&e, 0, sizeof e);
         snprintf(e.name, sizeof e.name, "%s", name);
         e.pi = (int)(from - g.peers); e.gen = from->gen; memcpy(e.dg, their, 32); e.fresh = fresh;
-        if (povf_push(name_lane(name) <= LANE_HI ? 0 : 1, &e, 0)) g.c.pull_ovf++;
+        if (povf_push(name_lane(name) <= LANE_HI ? 0 : 1, &e, fresh)) g.c.pull_ovf++;   /* live: front */
         else g.c.pull_ovf_drop++;
         return;
     }

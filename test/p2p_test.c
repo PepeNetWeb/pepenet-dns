@@ -12,8 +12,8 @@
  *       reorg down / up, flapping, multi-block and large height jumps,
  *       restart; phases evenly spread and re-keyed per process; per-block
  *       refill load ~1/10; eviction thrash; configurable blocks-per-credit.
- *   L3  pull dispatch by (lane, age): a quiet name is pulled before an older
- *       busy backlog; a quiet name's zget that hits PepeNet's GET_COOL_S is
+ *   L3  pull dispatch by (lane, live-before-AE, age): a quiet name is pulled
+ *       before an older busy backlog; a live relay before a bulk AE catch-up; a quiet name's zget that hits PepeNet's GET_COOL_S is
  *       remembered and answered when the cooldown ends (high lane).
  *   L4  dnzinv bytes <= 25% of each link's P6; dumps keep flowing meanwhile.
  *   L5  an op we already hold is skipped before admission (no ECDSA); the
@@ -354,6 +354,28 @@ static void sec_l3(void) {
     CKF(nd0 == 1 && fp[0]->nd > nd0 && !strcmp(fp[0]->dats[nd0], "stale"),
         "2000 busy zgets inside the 2 s cooldown (1 answered, rest dropped as before); the quiet name's zget is answered when it ends (%s)", fp[0]->nd > nd0 ? fp[0]->dats[nd0] : "-");
     CKF(C("get_hi") >= 1 && C("get_hi_sent") >= 1, "... via the high lane (get_hi=%lu sent=%lu)", C("get_hi"), C("get_hi_sent"));
+    /* a live relay (small dnzinv frame) is pulled ahead of a bulk anti-entropy
+     * catch-up in the same lane, even when the pull table has overflowed */
+    node(st, 1); fp_reset(fp[0]);
+    {
+        static uint8_t pg[1 + 64 * (1 + SP_NAME_MAX + 32)];
+        for (int f = 0; f < 200; f++) {                 /* 200 AE-page frames x 64 never-seen names */
+            int o = 0; pg[o++] = 64;
+            for (int k = 0; k < 64; k++) {
+                snprintf(nm, sizeof nm, "a%05d", f * 64 + k); int nl = (int)strlen(nm);
+                pg[o++] = (uint8_t)nl; memcpy(pg + o, nm, (size_t)nl); o += nl;
+                rnd_dg(dg, 50000u + (uint32_t)(f * 64 + k)); memcpy(pg + o, dg, 32); o += 32;
+            }
+            dnsnet_msg(h[0], "zinv", pg, o);
+            adv_ms(10);
+        }
+        int ng1 = fp[0]->ng;
+        rnd_dg(dg, 9); inv1(0, "live", dg);
+        tick_for(25000, 1000);
+        int pos = -1; for (int k = ng1; k < fp[0]->ng; k++) if (!strcmp(fp[0]->gets[k], "live")) { pos = k - ng1; break; }
+        CKF(C("pull_full") > 0 && pos >= 0 && pos < 64,
+            "12800-name AE catch-up (pull table overflowed): a live 1-name relay is pulled within the next 2 slot rounds (zget #%d after it, of %d)", pos, fp[0]->ng - ng1);
+    }
     sp_state_close(st);
 }
 
