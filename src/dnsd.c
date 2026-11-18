@@ -47,6 +47,13 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 
+/* L6/L7 transport hooks from the indexer's serve layer. Declared weak here so
+ * dnsd still builds and links against an indexer that predates them; then the
+ * L6 disconnect and the L7 drain gate are simply off (everything else works). */
+size_t idx_serve_peer_pending(void *peer) __attribute__((weak));
+void   idx_serve_peer_kick(void *peer, const char *why) __attribute__((weak));
+int    idx_serve_peer_exempt(void *peer) __attribute__((weak));
+
 #define PASS_PAUSE_S 20        /* pep blocks ~1/min; a pass ends when caught up */
 
 static volatile int g_stop = 0;
@@ -253,7 +260,8 @@ static void *net_main(void *a) {
     g_orc = dns_chain_oracle(g_ch);
     dnsnet_init(g_st, g_orc, g_verbose);
     dnsnet_set_seniority(name_senior);        /* kept for API compat; L2 lanes replace P10 */
-    dnsnet_set_transport(idx_serve_peer_pending, idx_serve_peer_kick, idx_serve_peer_exempt);
+    if (idx_serve_peer_pending && idx_serve_peer_kick && idx_serve_peer_exempt)   /* L6/L7 (weak, see top) */
+        dnsnet_set_transport(idx_serve_peer_pending, idx_serve_peer_kick, idx_serve_peer_exempt);
 
     IdxMeshHooks mesh = { mesh_up, mesh_msg, mesh_down, mesh_tick, NULL, serve_conn_misbehave };
     dnsnet_set_misbehave(serve_conn_misbehave);
