@@ -6,6 +6,9 @@
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "pepenet/wire.h"
 #include "pepenet/crypto.h"
@@ -199,7 +202,7 @@ static int dig_cb(void *u, const uint8_t *key, int klen, int op,
     return 1;
 }
 
-void dns_state_digest(SpState *st, const char *name, uint8_t out[32]) {
+static void digest_compute(SpState *st, const char *name, uint8_t out[32]) {
     static DigAcc a;                       /* big; single-threaded per store owner */
     a.off = 0;
     uint32_t f = sp_state_floor(st, name);
@@ -213,6 +216,84 @@ void dns_state_digest(SpState *st, const char *name, uint8_t out[32]) {
     } else { memset(a.buf + a.off, 0, 32); a.off += 32; }
     sp_state_iter(st, name, dig_cb, &a);   /* key-ordered ⇒ canonical */
     sp_sha256(a.buf, (size_t)a.off, out);
+}
+
+/* ── L10: per-name digest cache ─────────────────────────────────────────────
+ * One store (the gossip store dnsnet_init attaches) gets a direct-mapped cache
+ * of sha256 digests keyed by two independent per-process-seeded 64-bit hashes
+ * of the name (a false hit needs a 128-bit collision under a secret seed).
+ * Invalidation is exact, never time-based:
+ *   - every committed write through the store handle calls the sp_state change
+ *     hook (admit, epoch wipe, clear, sweep drop) -> that name's entry dies;
+ *     NULL (close, failed batch) -> the whole cache dies (generation bump);
+ *   - a write by ANY other connection/process bumps PRAGMA data_version,
+ *     checked on every lookup -> the whole cache dies.
+ * The digest is a pure function of the held rows, so a hit is byte-identical
+ * to recomputing it; the cache only saves the 3 queries + sha256. */
+#ifndef DNS_DG_CACHE_BITS
+#define DNS_DG_CACHE_BITS 18                /* 262,144 entries x 56 B, touched lazily */
+#endif
+typedef struct { uint64_t k1, k2; uint32_t gen; uint8_t dg[32]; } DgEnt;
+static struct {
+    SpState *st; DgEnt *t; uint32_t gen; int64_t dv; uint64_t s1, s2;
+    unsigned long hit, miss, inval, flush;
+} g_dc;
+
+static void dc_keys(const char *name, uint64_t *k1, uint64_t *k2) {
+    uint64_t a = 1469598103934665603ULL ^ g_dc.s1, b = 0x84222325CBF29CE4ULL ^ g_dc.s2;
+    for (const char *c = name; *c; c++) {
+        a ^= (uint8_t)*c; a *= 1099511628211ULL;
+        b += (uint8_t)*c; b *= 0x9E3779B97F4A7C15ULL; b ^= b >> 31;
+    }
+    a ^= a >> 29; b ^= b >> 33; b *= 0xFF51AFD7ED558CCDULL; b ^= b >> 33;
+    *k1 = a ? a : 1; *k2 = b;
+}
+static void dc_flush(void) { g_dc.gen++; if (!g_dc.gen) g_dc.gen = 1; g_dc.flush++; }
+static void dc_hook(void *u, const char *name) {
+    if (u != (void *)g_dc.st || !g_dc.t) return;
+    if (!name) { dc_flush(); return; }              /* everything may have changed */
+    if (!name[0]) { g_dc.st = NULL; dc_flush(); return; }   /* the handle is closing */
+    uint64_t k1, k2; dc_keys(name, &k1, &k2);
+    DgEnt *e = &g_dc.t[k1 & ((1u << DNS_DG_CACHE_BITS) - 1)];
+    if (e->k1 == k1 && e->k2 == k2) { e->gen = 0; g_dc.inval++; }
+}
+void dns_state_cache_attach(SpState *st) {
+    if (g_dc.st && g_dc.st != st) sp_state_set_change_hook(g_dc.st, NULL, NULL);
+    if (!g_dc.t) g_dc.t = calloc((size_t)1 << DNS_DG_CACHE_BITS, sizeof(DgEnt));
+    if (!g_dc.s1) {
+        uint64_t s[2] = { 0, 0 };
+        if (getentropy(s, sizeof s) != 0) { s[0] = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL; s[1] = (uint64_t)(uintptr_t)&s; }
+        g_dc.s1 = s[0] | 1; g_dc.s2 = s[1];
+    }
+    g_dc.st = st;
+    dc_flush();
+    g_dc.dv = st ? sp_state_data_version(st) : -1;
+    if (st) sp_state_set_change_hook(st, dc_hook, st);
+}
+void dns_state_cache_detach(void) {
+    if (g_dc.st) sp_state_set_change_hook(g_dc.st, NULL, NULL);
+    g_dc.st = NULL; dc_flush();
+}
+void dns_state_cache_stats(unsigned long *hit, unsigned long *miss, unsigned long *inval, unsigned long *flush) {
+    if (hit) *hit = g_dc.hit;
+    if (miss) *miss = g_dc.miss;
+    if (inval) *inval = g_dc.inval;
+    if (flush) *flush = g_dc.flush;
+}
+
+void dns_state_digest(SpState *st, const char *name, uint8_t out[32]) {
+    if (!st || st != g_dc.st || !g_dc.t || !name) { digest_compute(st, name, out); return; }
+    int64_t dv = sp_state_data_version(st);
+    if (dv < 0 || dv != g_dc.dv) { dc_flush(); g_dc.dv = dv; }   /* another writer */
+    uint64_t k1, k2; dc_keys(name, &k1, &k2);
+    DgEnt *e = &g_dc.t[k1 & ((1u << DNS_DG_CACHE_BITS) - 1)];
+    if (dv >= 0 && e->gen == g_dc.gen && e->k1 == k1 && e->k2 == k2) {
+        memcpy(out, e->dg, 32); g_dc.hit++; return;
+    }
+    digest_compute(st, name, out);
+    g_dc.miss++;
+    if (dv < 0) return;                    /* cannot tell other writers apart: no cache */
+    e->k1 = k1; e->k2 = k2; e->gen = g_dc.gen; memcpy(e->dg, out, 32);
 }
 
 /* G1: the zone as served. Rows belong to the ownership epoch they were

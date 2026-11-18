@@ -82,6 +82,12 @@ int  dns_state_zone(SpState *st, const char *name, zone *z);
 /* Zone digest for gossip: sha256(floor_le32 ‖ clear_id|zero32 ‖ op_ids in key
  * order). Equal digests ⇒ equal held state for the name. */
 void dns_state_digest(SpState *st, const char *name, uint8_t out[32]);
+/* L10: cache digests of ONE store (the gossip store). Exact invalidation via
+ * the sp_state change hook + PRAGMA data_version; attach again to switch
+ * stores, detach to stop. Uncached stores compute as before. */
+void dns_state_cache_attach(SpState *st);
+void dns_state_cache_detach(void);
+void dns_state_cache_stats(unsigned long *hit, unsigned long *miss, unsigned long *inval, unsigned long *flush);
 
 /* The zone as served for the CURRENT owner `owner`: empty (returns 0) when the
  * held rows were admitted under a different owner (a transfer whose new owner

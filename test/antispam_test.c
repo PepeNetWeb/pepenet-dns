@@ -3,10 +3,11 @@
  * both test-driven, so refills are exact and the run is instant).
  *
  * PROVES:
- *   A1. P1/P2  rapid local edits of one name: at most DNSNET_ANN_BURST invs go
- *              out at once, the rest coalesce into ONE later inv that carries
- *              the NEWEST digest; a normal cadence (one edit per block, or 4
- *              per block) is announced immediately every time.
+ *   A1. P1/L2  rapid local edits of one name: at most DNSNET_CREDIT_BURST invs
+ *              go out at once, the rest coalesce into ONE later inv (when the
+ *              next block credit arrives) that carries the NEWEST digest; one
+ *              edit per 10 blocks is announced immediately every time. (Was
+ *              P2: 1 per 15 s; nowon approved L2 block credit Nov 17.)
  *   A2. P3     five peers advertising the same differing digest cause exactly
  *              one dnzget; a timeout moves the pull to the next advertiser.
  *   A3. P4     a flood of edits of one record is admitted at the per-record
@@ -18,7 +19,8 @@
  *   A6. P8     a 10 000-name store is offered a page (4096) per AE period from
  *              a rotating cursor: every name within 3 periods; a small store is
  *              offered whole on connect, as before.
- *   A7. P10    under backlog the senior ring is flushed before the junior one.
+ *   A7. L2     under backlog a quiet name is relayed ahead of busy names
+ *              (stale-first lanes; replaces P10 seniority).
  *   A8. P11    the sweep covers > 256 names (old code: only the first 256), and
  *              the resumable step visits every name.
  *   A9. G1     after a transfer the previous owner's rows are not served; the
@@ -160,45 +162,53 @@ static uint8_t held_v(SpState *st, const char *name) {
 }
 
 /* ── A1 ─────────────────────────────────────────────────────────────────────── */
+/* P1 + L2 (replaces P2's 15 s refill): burst DNSNET_CREDIT_BURST relays per
+ * name, then one per 10 BLOCKS; over credit = one coalesced relay of the
+ * NEWEST set when a credit arrives. */
 static void sec_announce(void) {
-    printf("-- A1. P1/P2: announce limiter --\n");
+    printf("-- A1. P1/L2: announce limiter (block credit) --\n");
     SpState *st = sp_state_open(":memory:");
     node(st, 1);
-    for (int i = 0; i < 100; i++) { g_tip++; put_a(st, "zone", "www", (uint8_t)i, APRIV, APUB); dnsnet_announce("zone"); adv_ms(5); }
+    g_tip++;                                         /* all 100 edits at one tip */
+    for (int i = 0; i < 100; i++) { put_a(st, "zone", "www", (uint8_t)i, APRIV, APUB); dnsnet_announce("zone"); adv_ms(5); }
     char m[160];
-    snprintf(m, sizeof m, "100 edits in 0.5 s: %ld inv entries at once (<= 4)", fp[0]->inv_entries);
+    snprintf(m, sizeof m, "100 edits in 0.5 s at one tip: %ld inv entries at once (<= 4)", fp[0]->inv_entries);
     CK(fp[0]->inv_entries <= 4 && fp[0]->inv_entries >= 1, m);
+    long n0 = fp[0]->inv_entries;
     tick_for(16000, 250);
+    CK(fp[0]->inv_entries == n0, "no new block: no credit, nothing more after 16 s (stalled chain)");
+    g_tip += 10; tick_for(1000, 250);
     uint8_t cur[32]; dns_state_digest(st, "zone", cur);
-    CK(fp[0]->inv_entries == 5, "... then exactly one coalesced inv after the refill");
+    CK(fp[0]->inv_entries == n0 + 1, "... 10 blocks later exactly one coalesced inv");
     CK(fp[0]->ne && !memcmp(fp[0]->ent[fp[0]->ne - 1].dg, cur, 32), "... carrying the NEWEST digest");
     tick_for(120000, 1000);
-    CK(fp[0]->inv_entries <= 7, "... and nothing more for an idle name than the 60 s AE re-offer (1-name store)");
+    CK(fp[0]->inv_entries <= n0 + 1 + 3, "... and nothing more for an idle name than the 60 s AE re-offer (1-name store)");
 
-    /* cadence: one edit per block (60 s) and 4 per block, all immediate */
+    /* cadence: one edit per 10 blocks is always immediate */
     sp_state_close(st); st = sp_state_open(":memory:"); node(st, 1);
     int late = 0;
     for (int i = 0; i < 30; i++) {
         long before = fp[0]->inv_entries;
-        g_tip++; put_a(st, "zone", "www", (uint8_t)i, APRIV, APUB); dnsnet_announce("zone");
+        g_tip += 10; put_a(st, "zone", "www", (uint8_t)i, APRIV, APUB); dnsnet_announce("zone");
         uint8_t d[32]; dns_state_digest(st, "zone", d);
         int found = 0;
         for (int k = 0; k < fp[0]->ne; k++) if (!memcmp(fp[0]->ent[k].dg, d, 32)) found = 1;
         if (fp[0]->inv_entries == before || !found) late++;
         tick_for(60000, 1000);
     }
-    CK(late == 0, "one edit per block: every edit announced immediately");
-    late = 0;
-    for (int b = 0; b < 30; b++) {
-        for (int j = 0; j < 4; j++) {
-            long before = fp[0]->inv_entries;
-            g_tip++; put_a(st, "zone", "www", (uint8_t)(b * 4 + j), APRIV, APUB); dnsnet_announce("zone");
-            if (fp[0]->inv_entries == before) late++;
-            tick_for(15000, 1000);
-        }
+    CK(late == 0, "one edit per 10 blocks: every edit announced immediately");
+    /* one edit per block: the burst, then one per 10 blocks; the newest set is
+     * always relayed within 10 blocks (late, never lost) */
+    late = 0; int stale_max = 0, behind = 0;
+    for (int b = 0; b < 60; b++) {
+        long before = fp[0]->inv_entries;
+        g_tip++; put_a(st, "zone", "www", (uint8_t)(100 + b), APRIV, APUB); dnsnet_announce("zone");
+        if (fp[0]->inv_entries == before) { late++; behind++; } else behind = 0;
+        if (behind > stale_max) stale_max = behind;
+        tick_for(1000, 1000);
     }
-    snprintf(m, sizeof m, "four edits per block: every edit announced immediately (late=%d)", late);
-    CK(late == 0, m);
+    snprintf(m, sizeof m, "one edit per block for 60 blocks: %d coalesced, newest relayed within %d blocks (<= 10)", late, stale_max);
+    CK(late > 0 && stale_max <= 10, m);
     sp_state_close(st);
 }
 
@@ -316,7 +326,10 @@ static void sec_ae(SpState *big) {
     node(big, 0);
     h[0] = dnsnet_up(fp[0], fp_send);
     char m[160];
-    snprintf(m, sizeof m, "connect to a 10000-name store: first page = %ld names (4096)", fp[0]->inv_entries);
+    snprintf(m, sizeof m, "connect to a 10000-name store: the first page starts at once (%ld names, L4: 25%% of P6)", fp[0]->inv_entries);
+    CK(fp[0]->inv_entries >= 1024 && fp[0]->inv_entries <= 4096, m);
+    tick_for(5000, 250);
+    snprintf(m, sizeof m, "... and completes within 5 s (%ld names)", fp[0]->inv_entries);
     CK(fp[0]->inv_entries == 4096, m);
     tick_for(181000, 1000);
     /* every name seen at least once */
@@ -331,28 +344,33 @@ static void sec_ae(SpState *big) {
     put_a(small, "zone", "www", 1, APRIV, APUB); put_a(small, "zonf", "www", 1, APRIV, APUB);
     node(small, 0); h[0] = dnsnet_up(fp[0], fp_send);
     CK(fp[0]->inv_entries == 2, "a 2-name store is offered whole on connect (unchanged)");
-    tick_for(61000, 1000);
+    tick_for(89000, 1000);                          /* L8: first re-offer 30..89 s after connect */
     CK(fp[0]->inv_entries == 4, "... and whole again each AE period, once");
     sp_state_close(small);
 }
 
 /* ── A7 ─────────────────────────────────────────────────────────────────────── */
-static int senior_s(const char *name) { return name[0] == 's'; }
+/* L2 stale-first (replaces P10 seniority): under backlog a name that has been
+ * quiet for a long time is relayed before names that changed recently. */
 static void sec_senior(SpState *big) {
-    printf("-- A7. P10: senior names first under backlog --\n");
+    printf("-- A7. L2: stale-first lanes under backlog --\n");
     node(big, 1);
-    dnsnet_set_seniority(senior_s);
-    for (int r = 0; r < 4; r++) for (int i = 0; i < 10000; i++) { char nm[16]; snprintf(nm, sizeof nm, "n%05d", i); dnsnet_announce(nm); }
+    tick_for(10000, 250);                           /* let the connect page drain */
+    /* 10000 names relayed once now (lane 0: never relayed before) ... */
+    for (int i = 0; i < 10000; i++) { char nm[16]; snprintf(nm, sizeof nm, "n%05d", i); dnsnet_announce(nm); }
+    tick_for(40000, 250);                           /* drained (L4: 16 KiB/s of invs) */
+    g_tip += 10;                                    /* one credit each */
+    /* ... and again: now they are busy names (quiet 10 blocks, lane 3) */
+    for (int i = 0; i < 10000; i++) { char nm[16]; snprintf(nm, sizeof nm, "n%05d", i); dnsnet_announce(nm); }
     long before = fp[0]->ne;
-    dnsnet_announce("senior");
+    dnsnet_announce("quiet");                        /* a name nobody relayed recently */
     adv_ms(1000);
     fp[0]->ne = 0;
     dnsnet_tick();
-    CK(before > 0, "junior announces filled the peer's send budget");
-    int pos = -1; for (int k = 0; k < fp[0]->ne; k++) if (!strcmp(fp[0]->ent[k].name, "senior")) { pos = k; break; }
-    char m[160]; snprintf(m, sizeof m, "after the backlog, the next frame starts with the senior name (pos=%d)", pos);
-    CK(pos == 0, m);
-    dnsnet_set_seniority(NULL);
+    CK(before > 0, "busy-name announces filled the peer's announce budget");
+    int pos = -1; for (int k = 0; k < fp[0]->ne; k++) if (!strcmp(fp[0]->ent[k].name, "quiet")) { pos = k; break; }
+    char m[160]; snprintf(m, sizeof m, "the quiet name rides ahead of the busy backlog (pos=%d of %d sent this second)", pos, fp[0]->ne);
+    CK(pos >= 0 && pos < fp[0]->ne, m);
 }
 
 /* ── A8 ─────────────────────────────────────────────────────────────────────── */

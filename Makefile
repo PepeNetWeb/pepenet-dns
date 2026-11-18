@@ -178,3 +178,15 @@ check-antispam: antispam_test
 	./antispam_test
 
 .PHONY: check-antispam
+
+# local-only P2P spam fixes L1-L10 (dns_net.c, dns_state.c digest cache, mesh
+# state.c batch/dedup) on a fake clock; run under `unshare -rn`
+p2p_test: test/p2p_test.c src/dns_net.c $(wildcard src/*.h) $(NETLIB) $(IDXSECP)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC_TEST) -Dtime=ft_time -DDNSNET_TEST_CLOCK_MS=ft_ms -c src/dns_net.c -o build/p2p_dns_net.o
+	$(CC) $(CFLAGS) $(INC_TEST) -o $@ test/p2p_test.c build/p2p_dns_net.o src/dns_state.c src/zone.c src/dns_wire.c $(NETLIB) $(IDXSECP) -lsqlite3
+
+check-p2p: p2p_test
+	./p2p_test
+
+.PHONY: check-p2p

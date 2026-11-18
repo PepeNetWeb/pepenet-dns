@@ -252,7 +252,8 @@ static void *net_main(void *a) {
     if (!g_ch || !g_st) { fprintf(stderr, "dnsd: cannot open db/store\n"); g_stop = 1; return NULL; }
     g_orc = dns_chain_oracle(g_ch);
     dnsnet_init(g_st, g_orc, g_verbose);
-    dnsnet_set_seniority(name_senior);
+    dnsnet_set_seniority(name_senior);        /* kept for API compat; L2 lanes replace P10 */
+    dnsnet_set_transport(idx_serve_peer_pending, idx_serve_peer_kick, idx_serve_peer_exempt);
 
     IdxMeshHooks mesh = { mesh_up, mesh_msg, mesh_down, mesh_tick, NULL, serve_conn_misbehave };
     dnsnet_set_misbehave(serve_conn_misbehave);
@@ -316,6 +317,8 @@ static int usage(const char *p) {
         "  --name <apex>      flat pepenet name (§3.1: [a-z0-9-], 1..32)\n"
         "  --zone <file>      zone file to publish at startup\n"
         "  --ctl <path>       unix control socket for dns-cli (live updates)\n"
+        "  --uplink-mbit <n>  L7 Pi profile: cap dn* gossip peers at n/0.52 [no cap]\n"
+        "  --relay-credit-blocks <n>  L2: one relay credit per n blocks per name [10]\n"
         "  -v                 verbose\n", p);
     return 2;
 }
@@ -354,6 +357,16 @@ int main(int argc, char **argv) {
             /* a chain peer host:port; the mesh dials it over the chain wire */
             if (!strrchr(argv[i+1], ':')) return usage(argv[0]);
             snprintf(peers[n_peers++], sizeof peers[0], "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--uplink-mbit") && i+1 < argc) {
+            double mb = atof(argv[++i]);
+            if (mb <= 0) { fprintf(stderr, "bad --uplink-mbit '%s'\n", argv[i]); return 1; }
+            dnsnet_set_peer_cap(dnsnet_peer_cap_for_uplink(mb));
+        }
+        else if (!strcmp(argv[i], "--relay-credit-blocks") && i+1 < argc) {
+            int cb = atoi(argv[++i]);
+            if (cb < 1 || cb > 1440) { fprintf(stderr, "bad --relay-credit-blocks '%s' (1..1440)\n", argv[i]); return 1; }
+            dnsnet_set_credit_blocks(cb);
         }
         else if (!strcmp(argv[i], "-v")) g_verbose = 1;
         else return usage(argv[0]);
