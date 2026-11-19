@@ -8,6 +8,10 @@
  *   header_at  — blocks.hash at height; 0 above the sync tip (hold), -1 below
  *                the checkpoint horizon (admit on signature)
  *   tip        — the sync cursor height
+ * and, for the A8-1 epoch floor (pepenet/state.h SpChainOracle):
+ *   epoch_start — start height of the name's current ownership epoch (the
+ *                latest epochs row, only if its owner IS owner_now's answer;
+ *                -1 otherwise), active from DNS_A81_FROM
  */
 #ifndef DNS_CHAIN_H
 #define DNS_CHAIN_H
@@ -16,6 +20,15 @@
 #include <stdint.h>
 
 typedef struct DnsChain DnsChain;
+
+/* A8-1 activation (Pepecoin mainnet height): a name whose current ownership
+ * epoch starts at or above it gets the epoch-start floor on transfer; below it
+ * the legacy receiver-tip floor, byte-for-byte. PROPOSED value — the go/no-go
+ * and the final height are nowon's. Tests override with -DDNS_A81_FROM=<h>;
+ * 0 disables the rule. */
+#ifndef DNS_A81_FROM
+#define DNS_A81_FROM 1330000u
+#endif
 
 DnsChain     *dns_chain_open(const char *indexer_db_path);   /* NULL on failure */
 void          dns_chain_close(DnsChain *c);

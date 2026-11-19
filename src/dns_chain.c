@@ -15,6 +15,7 @@ struct DnsChain {
     sqlite3_stmt *q_tip;      /* SELECT v FROM meta WHERE k='height' */
     sqlite3_stmt *q_peer;     /* SELECT v FROM meta WHERE k='peer_height' */
     sqlite3_stmt *q_epoch;    /* SELECT MAX(start_height) FROM epochs WHERE name=? */
+    sqlite3_stmt *q_epoch_own;/* A8-1: latest epochs row (start, owner) */
 };
 
 /* Statements prepare LAZILY: on a first boot the indexer may not have created
@@ -52,6 +53,7 @@ void dns_chain_close(DnsChain *c) {
     if (c->q_tip)   sqlite3_finalize(c->q_tip);
     if (c->q_peer)  sqlite3_finalize(c->q_peer);
     if (c->q_epoch) sqlite3_finalize(c->q_epoch);
+    if (c->q_epoch_own) sqlite3_finalize(c->q_epoch_own);
     if (c->db)      sqlite3_close(c->db);
     free(c);
 }
@@ -104,8 +106,28 @@ static int oc_header(void *u, uint32_t height, uint8_t out[32]) {
     return -1;                                       /* below our checkpoint horizon */
 }
 
+/* A8-1: the current epoch's start height, only when the latest epochs row is
+ * the owner owner_now reports (a lapse row, or an epochs projection that lags
+ * the names table, answers -1 => the mesh keeps the legacy floor). */
+static int64_t oc_epoch(void *u, const char *name) {
+    DnsChain *c = u;
+    uint8_t own[20];
+    if (!oc_owner(u, name, own)) return -1;
+    if (!ensure(c, &c->q_epoch_own,
+                "SELECT start_height, owner FROM epochs WHERE name=?1 ORDER BY start_height DESC LIMIT 1")) return -1;
+    int64_t h = -1;
+    sqlite3_reset(c->q_epoch_own);
+    sqlite3_bind_text(c->q_epoch_own, 1, name, -1, SQLITE_STATIC);
+    if (sqlite3_step(c->q_epoch_own) == SQLITE_ROW &&
+        sqlite3_column_bytes(c->q_epoch_own, 1) == 20 &&
+        memcmp(sqlite3_column_blob(c->q_epoch_own, 1), own, 20) == 0)
+        h = sqlite3_column_int64(c->q_epoch_own, 0);
+    sqlite3_reset(c->q_epoch_own);   /* release the read txn */
+    return h;
+}
+
 SpChainOracle dns_chain_oracle(DnsChain *c) {
-    SpChainOracle o = { c, oc_owner, oc_header, oc_tip };
+    SpChainOracle o = { c, oc_owner, oc_header, oc_tip, oc_epoch, DNS_A81_FROM };
     return o;
 }
 

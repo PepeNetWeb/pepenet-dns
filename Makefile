@@ -134,8 +134,8 @@ dnsd_core_test: $(CORE_SRC) $(wildcard src/*.h) $(NETLIB) $(IDXSECP)
 # Everything, including the existing codec/store proof. Each binary prints its
 # own "N ok, M failed" line and exits non-zero on any FAIL; check-all runs them
 # all before reporting, so one failure never hides the rest.
-check-all: check wire_test zone_test dnsd_core_test
-	@rc=0; for t in wire_test zone_test dnsd_core_test; do \
+check-all: check wire_test zone_test dnsd_core_test a81_dns_test
+	@rc=0; for t in wire_test zone_test dnsd_core_test a81_dns_test; do \
 	  echo "=== $$t ==="; ./$$t || rc=1; echo; done; \
 	  if [ $$rc -ne 0 ]; then echo "check-all: FAILURES above"; else echo "check-all: all passed"; fi; \
 	  exit $$rc
@@ -167,6 +167,16 @@ check-gossip: net_test
 	./net_test
 
 .PHONY: check-gossip
+
+# A8-1 epoch floor through the real dns_chain oracle + the shipping DNS_A81_FROM
+A81_SRC := test/a81_dns_test.c src/dns_chain.c src/dns_state.c src/zone.c src/dns_wire.c
+a81_dns_test: $(A81_SRC) $(wildcard src/*.h) $(NETLIB) $(IDXSECP)
+	$(CC) $(CFLAGS) -D_DEFAULT_SOURCE $(INC_TEST) -o $@ $(A81_SRC) $(NETLIB) $(IDXSECP) -lsqlite3
+
+check-a81: a81_dns_test
+	./a81_dns_test
+
+.PHONY: check-a81
 
 # local anti-spam limits (P1-P4, P6, P8, P10, P11, G1) on a fake clock
 antispam_test: test/antispam_test.c src/dns_net.c $(wildcard src/*.h) $(NETLIB) $(IDXSECP)
