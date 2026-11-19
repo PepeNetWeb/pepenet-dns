@@ -19,6 +19,12 @@
 #include <string.h>
 #include <unistd.h>
 
+/* per-process temp paths: parallel `make check` runs must not share a file */
+static const char *tp(const char *tag) {
+    static char buf[8][96]; static int k;
+    char *b = buf[k++ & 7]; snprintf(b, 96, "/tmp/a81dns_%d_%s.db", (int)getpid(), tag); return b;
+}
+
 static int fails, oks;
 #define CK(c, m) do { if (c) { printf("ok   %s\n", m); oks++; } else { printf("FAIL %s\n", m); fails++; } } while (0)
 static void ex(sqlite3 *db, const char *q) { char *e = 0; if (sqlite3_exec(db, q, 0, 0, &e) != SQLITE_OK) { fprintf(stderr, "%s: %s\n", q, e); exit(2); } }
@@ -80,8 +86,8 @@ static int origin_op(const char *store, uint8_t *out) {
  * tip E + lag. Returns the receiver's admit rc (err filled). */
 static int scenario(uint32_t E, uint32_t lag, char *err, int *alice_rc) {
     Key A = mk("a81dns-alice"), B = mk("a81dns-bob");
-    const char *pc = "/tmp/a81dns_pub_chain.db", *rc_ = "/tmp/a81dns_rcv_chain.db";
-    const char *ps_a = "/tmp/a81dns_alice_store.db", *ps_b = "/tmp/a81dns_bob_store.db", *rs = "/tmp/a81dns_rcv_store.db";
+    const char *pc = tp("pub_chain"), *rc_ = tp("rcv_chain");
+    const char *ps_a = tp("alice_store"), *ps_b = tp("bob_store"), *rs = tp("rcv_store");
     unlink(ps_a); unlink(ps_b); unlink(rs);
     chain_make(pc, E - 60, E - 1); chain_make(rc_, E - 60, E - 1);
     chain_owner(pc, "zone", A.h160, E - 50, 1); chain_owner(rc_, "zone", A.h160, E - 50, 1);
@@ -136,7 +142,7 @@ int main(void) {
     /* oc_epoch guards */
     {
         Key A = mk("g-a"), B = mk("g-b");
-        const char *p = "/tmp/a81dns_guard.db";
+        const char *p = tp("guard");
         chain_make(p, F - 20, F + 5);
         chain_owner(p, "zone", A.h160, F - 10, 1);
         chain_owner(p, "zone", B.h160, F + 1, 0);                 /* names moved, epochs row not yet */
