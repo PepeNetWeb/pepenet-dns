@@ -1,0 +1,72 @@
+# CI for PepeNetWeb/pepenet-dns — build + unit/regression tests on x86_64 and arm64.
+# Free GitHub-hosted runners (public repo). No secrets, no deploy, no network
+# beyond cloning sibling public repos; tests bind loopback only.
+#
+# Skipped on purpose (documented, not hidden):
+#   - check-gossip (test/net_test): known N7 livelock, tracked separately.
+#   - t_webproxy (binds 8443/8444) is in the tls repo, not run here.
+#   - IDX_SRC is overridden to add dbcheck.c and snapshot.c: main's Makefile
+#     omits them (pre-existing link gap; fix belongs in the Makefile).
+#   Runs: check (state + tcp_loris), check-all, check-antispam, check-p2p.
+name: ci
+on:
+  push:
+    branches: [main, 'ci/**', 'keeper/**', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libsqlite3-dev cmake
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: pepenet-dns
+          submodules: false
+          persist-credentials: false
+      - name: sibling repos (same branch if present, else main)
+        env:
+          BR: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          for r in namespace-indexer pepenet-mesh namespace-protocol; do
+            u="https://github.com/PepeNetWeb/${r}.git"
+            b=main; git ls-remote --exit-code --heads "$u" "$BR" >/dev/null 2>&1 && b="$BR"
+            echo "$r @ $b"
+            git clone -q --depth 1 --branch "$b" --recurse-submodules --shallow-submodules "$u" "$r"
+            git -C "$r" log -1 --format='  %h %s'
+          done
+      - name: build
+        working-directory: pepenet-dns
+        env:
+          CFLAGS: -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wshadow
+        run: |
+          make -C ../namespace-indexer build/secp/lib/libsecp256k1.a
+          make -C ../pepenet-mesh libpepenetnet.a
+          I=../namespace-indexer/src
+          echo "IDX_SRC=$(echo "$I"/{attrib,adapter,oracle_feed,db,dbcheck,snapshot,chain,base58,sync,pow,serve_store,txcheck,mempool,net_policy}.c) ../namespace-indexer/protocol/shim/secp_shim.c" > ../idx_src.mk
+          make -j"$(nproc)" "$(cat ../idx_src.mk)"
+      - name: test
+        working-directory: pepenet-dns
+        timeout-minutes: 20
+        env:
+          CFLAGS: -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wshadow
+        run: |
+          rc=0
+          for t in check check-all check-antispam check-p2p; do
+            echo "=== make $t"
+            make "$(cat ../idx_src.mk)" "$t" || rc=1
+          done
+          exit "$rc"
